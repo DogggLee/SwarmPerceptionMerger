@@ -68,6 +68,14 @@ def create_app(merger: PerceptionMerger) -> Flask:
                     return jsonify({"error": "perception_frame must be an object"}), 400
                 frame = PerceptionFrame.from_dict(raw_frame)
                 result = merger.merge_frame(frame, global_objects, merge_mode=request_mode)
+                # breakpoint()
+                new_op = False
+                for op in result.create_ops:
+                    print("create: ", op.target_id, op.payload["position"])
+                    new_op = True
+                for op in result.update_ops:
+                    print("update: ", op.target_id, op.payload["fused_position"])
+                
         except (KeyError, ValueError, TypeError) as exc:
             return jsonify({"error": f"Invalid request payload: {exc}"}), 400
 
@@ -78,11 +86,16 @@ def create_app(merger: PerceptionMerger) -> Flask:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default=None, help="Path to merger config JSON")
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="config/merger.json",
+        help="Path to merger config JSON",
+    )
     parser.add_argument(
         "--correlation",
         type=str,
-        default=None,
+        default="config/class_correlation.json",
         help="Path to class correlation JSON",
     )
     parser.add_argument("--host", type=str, default="0.0.0.0")

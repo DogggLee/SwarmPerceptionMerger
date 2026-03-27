@@ -1,0 +1,20 @@
+{
+  "planar_distance_threshold": 30.0,
+  "height_distance_threshold": 20.0,
+  "velocity_angle_threshold_deg": 360.0,
+  "elec_ray_angle_threshold_deg": 12.0,
+  "elec_position_correction_alpha": 0.15,
+  "track_window_size": 8,
+  "trajectory_window_size": 12,
+  "fusion_alpha": 0.6,
+  "enable_visibility": false,
+  "default_merge_mode": "simple",
+  "cost_weights": {
+    "class": 2.0,
+    "distance": 2.0,
+    "velocity": 1.0,
+    "track": 1.0,
+    "visibility": 0.5,
+    "elec_angle": 2.5
+  }
+}

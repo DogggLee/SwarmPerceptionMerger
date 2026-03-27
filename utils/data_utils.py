@@ -40,6 +40,7 @@ class Detection:
     position: Vector3
     velocity: Vector3
     track_id: int
+    bearing_vector: Optional[Vector3] = None
     bbox: Optional[List[float]] = None
     image: Optional[Any] = None
     confidence: float = 1.0
@@ -51,6 +52,11 @@ class Detection:
             position=_vec3(data["position"], "detection.position"),
             velocity=_vec3(data.get("velocity", [0, 0, 0]), "detection.velocity"),
             track_id=int(data["track_id"]),
+            bearing_vector=(
+                _vec3(data["bearing_vector"], "detection.bearing_vector")
+                if "bearing_vector" in data and data["bearing_vector"] is not None
+                else None
+            ),
             bbox=data.get("bbox"),
             image=data.get("image"),
             confidence=float(data.get("confidence", 1.0)),
@@ -62,6 +68,7 @@ class Detection:
             "position": list(self.position),
             "velocity": list(self.velocity),
             "track_id": self.track_id,
+            "bearing_vector": list(self.bearing_vector) if self.bearing_vector is not None else None,
             "bbox": self.bbox,
             "image": self.image,
             "confidence": self.confidence,
@@ -137,6 +144,7 @@ class ObjectItem:
     class_votes: Dict[int, Dict[int, int]] = field(default_factory=dict)
     trajectory: List[Vector3] = field(default_factory=list)
     observations: List[Dict[str, Any]] = field(default_factory=list)
+    spatial_valid: bool = True
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "ObjectItem":
@@ -164,6 +172,7 @@ class ObjectItem:
             class_votes=class_votes,
             trajectory=trajectory,
             observations=list(data.get("observations", [])),
+            spatial_valid=bool(data.get("spatial_valid", True)),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -178,6 +187,7 @@ class ObjectItem:
             "class_votes": class_votes,
             "trajectory": [list(p) for p in self.trajectory],
             "observations": self.observations,
+            "spatial_valid": self.spatial_valid,
         }
 
 
@@ -198,6 +208,16 @@ class MergeOperation:
             "reason": self.reason,
         }
 
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "MergeOperation":
+        return cls(
+            operation=str(data["operation"]),
+            target_id=int(data["target_id"]),
+            payload=dict(data.get("payload", {})),
+            score=float(data["score"]) if data.get("score") is not None else None,
+            reason=str(data["reason"]) if data.get("reason") is not None else None,
+        )
+
 
 @dataclass
 class MergeResult:
@@ -214,12 +234,23 @@ class MergeResult:
             "debug_info": self.debug_info,
         }
 
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "MergeResult":
+        return cls(
+            update_ops=[MergeOperation.from_dict(item) for item in data.get("update_ops", [])],
+            create_ops=[MergeOperation.from_dict(item) for item in data.get("create_ops", [])],
+            alerts=list(data.get("alerts", [])),
+            debug_info=dict(data.get("debug_info", {})),
+        )
+
 
 @dataclass
 class MergeConfig:
     planar_distance_threshold: float = 80.0
     height_distance_threshold: float = 30.0
     velocity_angle_threshold_deg: float = 80.0
+    elec_ray_angle_threshold_deg: float = 12.0
+    elec_position_correction_alpha: float = 0.15
     track_window_size: int = 8
     trajectory_window_size: int = 12
     fusion_alpha: float = 0.6
@@ -232,6 +263,7 @@ class MergeConfig:
             "velocity": 1.0,
             "track": 1.0,
             "visibility": 0.5,
+            "elec_angle": 2.5,
         }
     )
 
@@ -248,6 +280,12 @@ class MergeConfig:
             ),
             "velocity_angle_threshold_deg": float(
                 data.get("velocity_angle_threshold_deg", cls.velocity_angle_threshold_deg)
+            ),
+            "elec_ray_angle_threshold_deg": float(
+                data.get("elec_ray_angle_threshold_deg", cls.elec_ray_angle_threshold_deg)
+            ),
+            "elec_position_correction_alpha": float(
+                data.get("elec_position_correction_alpha", cls.elec_position_correction_alpha)
             ),
             "track_window_size": int(data.get("track_window_size", cls.track_window_size)),
             "trajectory_window_size": int(

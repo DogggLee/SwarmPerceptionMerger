@@ -1,0 +1,120 @@
+{
+  "seed": 42,
+  "dt": 0.5,
+  "map_size": [1000, 1000],
+  "weather": "clear",
+  "lighting": "night",
+  "shared_patrol_route": [
+    [100, 100, 120],
+    [1100, 100, 120],
+    [1100, 1100, 120],
+    [100, 1100, 120],
+    [100, 100, 120]
+  ],
+  "uavs": [
+    {
+      "uav_id": 1,
+      "speed": 35,
+      "sensor": {
+        "sensor_type": "RGB",
+        "params": {
+          "forward_range": 320.0,
+          "width": 220.0,
+          "image_width": 1280,
+          "image_height": 720
+        },
+        "position_noise_std": 2.0,
+        "velocity_noise_std": 0.8,
+        "dropout_prob": 0.08
+      }
+    },
+    {
+      "uav_id": 2,
+      "speed": 32,
+      "sensor": {
+        "sensor_type": "IF",
+        "params": {
+          "forward_range": 300.0,
+          "width": 200.0
+        },
+        "position_noise_std": 2.5,
+        "velocity_noise_std": 1.0,
+        "dropout_prob": 0.06
+      }
+    },
+    {
+      "uav_id": 3,
+      "speed": 30,
+      "sensor": {
+        "sensor_type": "RADAR",
+        "params": {
+          "max_range": 420.0
+        },
+        "position_noise_std": 3.0,
+        "velocity_noise_std": 1.2,
+        "dropout_prob": 0.04
+      }
+    },
+    {
+      "uav_id": 4,
+      "speed": 28,
+      "sensor": {
+        "sensor_type": "ELEC",
+        "params": {
+          "max_range": 460.0,
+          "bearing_range_estimate": 180.0
+        },
+        "position_noise_std": 0.0,
+        "velocity_noise_std": 0.0,
+        "dropout_prob": 0.02
+      }
+    }
+  ],
+  "targets": [
+    {
+      "target_id": 101,
+      "motion_mode": "patrol",
+      "position": [300, 250, 0],
+      "velocity": [6, 2, 0],
+      "speed_range": [4.0, 8.0],
+      "waypoints": [
+        [300, 250, 0],
+        [700, 250, 0],
+        [700, 700, 0],
+        [300, 700, 0]
+      ],
+      "class_by_sensor": {
+        "RADAR": 1,
+        "IF": 1,
+        "RGB": 1,
+        "ELEC": 1
+      }
+    },
+    {
+      "target_id": 102,
+      "motion_mode": "random",
+      "position": [900, 600, 0],
+      "velocity": [0, 0, 0],
+      "speed_range": [2.0, 6.0],
+      "random_heading_interval": 2.5,
+      "class_by_sensor": {
+        "RADAR": 2,
+        "IF": 2,
+        "RGB": 2,
+        "ELEC": 2
+      }
+    },
+    {
+      "target_id": 103,
+      "motion_mode": "static",
+      "position": [600, 500, 0],
+      "velocity": [0, 0, 0],
+      "class_by_sensor": {
+        "RADAR": 3,
+        "IF": 3,
+        "RGB": 3,
+        "ELEC": 3
+      }
+    }
+  ]
+}

@@ -19,6 +19,8 @@ If you add dependencies, introduce a standard manifest such as `pyproject.toml` 
 ## Coding Style & Naming Conventions
 Follow PEP 8 with 4-space indentation and UTF-8 source files. Use `snake_case` for functions, methods, and module names; use `PascalCase` for classes such as `PerceptionMerger` and `GlobalInfo`; keep enum members in `UPPER_CASE`. Prefer explicit type hints on public methods and concise docstrings for fusion, alignment, and update logic. Keep comments focused on non-obvious behavior, especially around timestamps, coordinate frames, and matching rules.
 
+所有的class和function等实现开头都需要注明其实际用途。  函数需要注明每个输入和输出参数的数据类型和具体意义
+
 ## Testing Guidelines
 Place tests under `tests/` with names like `test_perception_merger.py`. Mirror the source layout when practical, for example `tests/test_global_info.py` for `simulator/global_info.py`. Cover association, timestamp alignment, ID assignment, and stale-track handling. For new matching logic, include at least one deterministic fixture with small synthetic observations.
 
