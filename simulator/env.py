@@ -241,6 +241,9 @@ class SwarmEnv:
 
     def _build_uavs(self) -> List[UAVState]:
         """根据配置构建无人机与传感器状态。"""
+        if self._use_generated_uavs():
+            return self._build_generated_uavs()
+
         raw_uavs = list(self.config.get("uavs", []))
         shared_route = self.config.get("shared_patrol_route")
         if shared_route and raw_uavs:
@@ -281,8 +284,143 @@ class SwarmEnv:
             )
         return uavs
 
+    def _use_generated_uavs(self) -> bool:
+        """判断是否启用按数量自动生成 UAV 的模式。
+
+        Args:
+            None: 不需要输入参数。
+        Returns:
+            bool: True 表示使用生成模式，False 表示沿用显式 `uavs` 配置。
+        """
+        return "uav_counts" in self.config
+
+    def _build_generated_uavs(self) -> List[UAVState]:
+        """基于模态数量、模态统一配置和路线池随机生成 UAV。
+
+        Args:
+            None: 不需要输入参数。
+        Returns:
+            List[UAVState]: 按 seed 可复现生成的 UAV 列表。
+        """
+        generation_seed = int(self.config.get("generation_seed", self.config.get("seed", 0)))
+        gen_rng = random.Random(generation_seed)
+        counts_raw = self.config.get("uav_counts", {})
+        profiles_raw = self.config.get("uav_profiles", {})
+        routes_raw = self.config.get("patrol_routes", [])
+        if not routes_raw and self.config.get("shared_patrol_route"):
+            routes_raw = [self.config["shared_patrol_route"]]
+
+        world_routes: List[List[Vector3]] = []
+        for route in routes_raw:
+            points = [self._to_world_coord(_vec3(p, default_z=50.0)) for p in route]
+            if len(points) >= 2:
+                world_routes.append(points)
+        if not world_routes:
+            fallback = [
+                (0.1, 0.1, 0.6),
+                (0.9, 0.1, 0.6),
+                (0.9, 0.9, 0.6),
+                (0.1, 0.9, 0.6),
+                (0.1, 0.1, 0.6),
+            ]
+            world_routes = [[self._to_world_coord(p) for p in fallback]]
+
+        uavs: List[UAVState] = []
+        next_uav_id = 1
+        for sensor_key, count_val in counts_raw.items():
+            sensor_type = SensorType.parse(sensor_key)
+            count = int(count_val)
+            if count <= 0:
+                continue
+            profile = self._resolve_uav_profile(sensor_type=sensor_type, profiles=profiles_raw)
+            speed = float(profile.get("speed", 20.0))
+            sensor_cfg = profile.get("sensor", {})
+            params = dict(sensor_cfg.get("params", {}))
+            position_noise_std = float(sensor_cfg.get("position_noise_std", 2.0))
+            velocity_noise_std = float(sensor_cfg.get("velocity_noise_std", 0.8))
+            dropout_prob = float(sensor_cfg.get("dropout_prob", 0.05))
+            for _ in range(count):
+                sensor = SensorSpec(
+                    sensor_type=sensor_type,
+                    params=dict(params),
+                    position_noise_std=position_noise_std,
+                    velocity_noise_std=velocity_noise_std,
+                    dropout_prob=dropout_prob,
+                )
+                route = list(gen_rng.choice(world_routes))
+                if gen_rng.random() < 0.5:
+                    route = list(reversed(route))
+                start_pos = route[0]
+                yaw_deg = _yaw_deg_from_vec(_vec_sub(route[1], route[0])) if len(route) > 1 else 0.0
+                uavs.append(
+                    UAVState(
+                        uav_id=next_uav_id,
+                        sensor=sensor,
+                        position=start_pos,
+                        velocity=(0.0, 0.0, 0.0),
+                        yaw_deg=yaw_deg,
+                        waypoints=route,
+                        speed=speed,
+                        patrol_forward=True,
+                    )
+                )
+                next_uav_id += 1
+        return uavs
+
+    def _resolve_uav_profile(self, sensor_type: int, profiles: Dict[str, Any]) -> Dict[str, Any]:
+        """解析指定模态的 UAV 统一配置。
+
+        Args:
+            sensor_type (int): 传感器模态枚举值。
+            profiles (Dict[str, Any]): 全部模态配置字典。
+        Returns:
+            Dict[str, Any]: 当前模态的 UAV 统一配置。
+        """
+        sensor_name = next((item.name for item in SensorType if item.value == sensor_type), str(sensor_type))
+        candidates = [sensor_name, str(sensor_type), sensor_type]
+        for key in candidates:
+            if key in profiles:
+                return dict(profiles[key])
+        defaults: Dict[int, Dict[str, Any]] = {
+            SensorType.RADAR.value: {
+                "speed": 30.0,
+                "sensor": {"params": {"max_range": 420.0}, "position_noise_std": 3.0, "velocity_noise_std": 1.2, "dropout_prob": 0.04},
+            },
+            SensorType.IF.value: {
+                "speed": 32.0,
+                "sensor": {
+                    "params": {"forward_range": 300.0, "width": 200.0},
+                    "position_noise_std": 2.5,
+                    "velocity_noise_std": 1.0,
+                    "dropout_prob": 0.06,
+                },
+            },
+            SensorType.RGB.value: {
+                "speed": 35.0,
+                "sensor": {
+                    "params": {"forward_range": 320.0, "width": 220.0, "image_width": 1280.0, "image_height": 720.0},
+                    "position_noise_std": 2.0,
+                    "velocity_noise_std": 0.8,
+                    "dropout_prob": 0.08,
+                },
+            },
+            SensorType.ELEC.value: {
+                "speed": 28.0,
+                "sensor": {
+                    "params": {"max_range": 460.0, "bearing_range_estimate": 180.0},
+                    "position_noise_std": 0.0,
+                    "velocity_noise_std": 0.0,
+                    "dropout_prob": 0.02,
+                },
+            },
+        }
+        return dict(defaults.get(sensor_type, {"speed": 20.0, "sensor": {"params": {}}}))
+
     def _build_targets(self) -> List[TargetState]:
         """根据配置构建任务目标状态。"""
+        if self._use_generated_targets():
+            return self._build_generated_targets()
+
         targets: List[TargetState] = []
         for idx, item in enumerate(self.config.get("targets", [])):
             position = self._to_world_coord(_vec3(item.get("position", [0, 0, 0])))
@@ -306,6 +444,147 @@ class SwarmEnv:
                 )
             )
         return targets
+
+    def _use_generated_targets(self) -> bool:
+        """判断是否启用按数量自动生成目标模式。
+
+        Args:
+            None: 不需要输入参数。
+        Returns:
+            bool: True 表示按 `target_count` 随机生成目标。
+        """
+        return "target_count" in self.config
+
+    def _build_generated_targets(self) -> List[TargetState]:
+        """按数量随机生成目标及其跨模态类别组合。
+
+        Args:
+            None: 不需要输入参数。
+        Returns:
+            List[TargetState]: 生成的目标状态列表。
+        """
+        generation_seed = int(self.config.get("generation_seed", self.config.get("seed", 0)))
+        gen_rng = random.Random(generation_seed + 2026)
+        target_count = max(0, int(self.config.get("target_count", 0)))
+        target_defaults = dict(self.config.get("target_defaults", {}))
+        speed_range_raw = target_defaults.get("speed_range", [2.0, 6.0])
+        speed_range = (float(speed_range_raw[0]), float(speed_range_raw[1]))
+        random_heading_interval = float(target_defaults.get("random_heading_interval", 3.0))
+        motion_modes_raw = self.config.get("target_motion_modes", ["random", "patrol", "static"])
+        motion_modes = [str(item).lower() for item in motion_modes_raw] if isinstance(motion_modes_raw, list) else ["random"]
+        if not motion_modes:
+            motion_modes = ["random"]
+        class_profiles = self._extract_class_profiles_from_correlation(self.config.get("class_correlation", {}))
+        if not class_profiles:
+            class_profiles = [{SensorType.RADAR.value: 1, SensorType.IF.value: 1, SensorType.RGB.value: 1, SensorType.ELEC.value: 1}]
+
+        target_routes_raw = self.config.get("target_patrol_routes", self.config.get("patrol_routes", []))
+        world_target_routes: List[List[Vector3]] = []
+        for route in target_routes_raw:
+            points = [self._to_world_coord(_vec3(p, default_z=0.0)) for p in route]
+            if len(points) >= 2:
+                world_target_routes.append(points)
+
+        id_start = int(target_defaults.get("id_start", 101))
+        targets: List[TargetState] = []
+        for idx in range(target_count):
+            class_by_sensor = dict(gen_rng.choice(class_profiles))
+            motion_mode = str(gen_rng.choice(motion_modes))
+            x_n = gen_rng.uniform(0.05, 0.95)
+            y_n = gen_rng.uniform(0.05, 0.95)
+            position = self._to_world_coord((x_n, y_n, 0.0))
+            velocity = (0.0, 0.0, 0.0)
+            waypoints: List[Vector3] = []
+            if motion_mode == "random":
+                heading = gen_rng.uniform(-math.pi, math.pi)
+                v = gen_rng.uniform(speed_range[0], speed_range[1])
+                velocity = (v * math.cos(heading), v * math.sin(heading), 0.0)
+            elif motion_mode == "patrol":
+                if world_target_routes:
+                    waypoints = list(gen_rng.choice(world_target_routes))
+                    if gen_rng.random() < 0.5:
+                        waypoints = list(reversed(waypoints))
+                else:
+                    waypoints = self._sample_random_route(gen_rng=gen_rng, n_points=4, z_norm=0.0)
+                position = waypoints[0]
+            else:
+                motion_mode = "static"
+                velocity = (0.0, 0.0, 0.0)
+
+            targets.append(
+                TargetState(
+                    target_id=id_start + idx,
+                    class_by_sensor=class_by_sensor,
+                    position=position,
+                    velocity=velocity,
+                    motion_mode=motion_mode,
+                    speed_range=speed_range,
+                    waypoints=waypoints,
+                    random_heading_interval=random_heading_interval,
+                )
+            )
+        return targets
+
+    def _sample_random_route(self, gen_rng: random.Random, n_points: int, z_norm: float) -> List[Vector3]:
+        """随机采样一条归一化巡逻航线并映射到世界坐标。
+
+        Args:
+            gen_rng (random.Random): 随机数发生器。
+            n_points (int): 航点数量。
+            z_norm (float): 归一化高度。
+        Returns:
+            List[Vector3]: 世界坐标下的航点序列。
+        """
+        points: List[Vector3] = []
+        for _ in range(max(2, int(n_points))):
+            x_n = gen_rng.uniform(0.05, 0.95)
+            y_n = gen_rng.uniform(0.05, 0.95)
+            points.append(self._to_world_coord((x_n, y_n, z_norm)))
+        return points
+
+    def _extract_class_profiles_from_correlation(self, correlation: Dict[str, Any]) -> List[Dict[int, int]]:
+        """从类别关联表抽取可采样的跨模态类别组合。
+
+        Args:
+            correlation (Dict[str, Any]): 类别关联配置。
+        Returns:
+            List[Dict[int, int]]: 每条元素表示一个可用的 `class_by_sensor` 组合。
+        """
+        raw_profiles: List[Dict[int, int]] = []
+        all_sensors = [sensor.value for sensor in SensorType]
+        for src_sensor_key, src_class_map in correlation.items():
+            try:
+                src_sensor = SensorType.parse(src_sensor_key)
+            except ValueError:
+                continue
+            if not isinstance(src_class_map, dict):
+                continue
+            for src_class_key, mapped in src_class_map.items():
+                try:
+                    src_class = int(src_class_key)
+                except (TypeError, ValueError):
+                    continue
+                profile: Dict[int, int] = {src_sensor: src_class}
+                if isinstance(mapped, dict):
+                    for dst_sensor_key, dst_classes in mapped.items():
+                        try:
+                            dst_sensor = SensorType.parse(dst_sensor_key)
+                        except ValueError:
+                            continue
+                        if isinstance(dst_classes, list) and dst_classes:
+                            profile[dst_sensor] = int(dst_classes[0])
+                for sensor_id in all_sensors:
+                    profile.setdefault(sensor_id, src_class)
+                raw_profiles.append(profile)
+        unique_profiles: List[Dict[int, int]] = []
+        seen = set()
+        for profile in raw_profiles:
+            key = tuple(sorted(profile.items()))
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_profiles.append(profile)
+        return unique_profiles
 
     def _split_waypoints(self, route: Sequence[Sequence[float]], n_parts: int) -> List[List[Vector3]]:
         """将共享航线按段切分给多架无人机。"""
