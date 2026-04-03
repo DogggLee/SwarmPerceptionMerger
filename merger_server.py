@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 from typing import Any, Dict, List
 
 from flask import Flask, jsonify, request
@@ -26,7 +27,29 @@ def _build_merger(config_path: str | None, correlation_path: str | None) -> Perc
     corr_dict = _load_json_file(correlation_path)
     config = MergeConfig.from_dict(config_dict)
     merger = PerceptionMerger(config=config, class_correlation=corr_dict)
+    merger.set_logger(_build_console_logger())
     return merger
+
+
+def _build_console_logger() -> logging.Logger:
+    """构建用于 merger_server 终端输出的 logger。
+
+    Args:
+        None: 不需要输入参数。
+    Returns:
+        logging.Logger: INFO 及以上级别输出到终端的日志器。
+    """
+    logger = logging.getLogger("PerceptionMergerServerConsole")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    for handler in list(logger.handlers):
+        logger.removeHandler(handler)
+        handler.close()
+    stream_handler = logging.StreamHandler()
+    stream_handler.setLevel(logging.INFO)
+    stream_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    logger.addHandler(stream_handler)
+    return logger
 
 
 def create_app(merger: PerceptionMerger) -> Flask:
@@ -69,12 +92,12 @@ def create_app(merger: PerceptionMerger) -> Flask:
                 frame = PerceptionFrame.from_dict(raw_frame)
                 result = merger.merge_frame(frame, global_objects, merge_mode=request_mode)
                 # breakpoint()
-                new_op = False
-                for op in result.create_ops:
-                    print("create: ", op.target_id, op.payload["position"])
-                    new_op = True
-                for op in result.update_ops:
-                    print("update: ", op.target_id, op.payload["fused_position"])
+                # new_op = False
+                # for op in result.create_ops:
+                #     print("create: ", op.target_id, op.payload["position"])
+                #     new_op = True
+                # for op in result.update_ops:
+                #     print("update: ", op.target_id, op.payload["fused_position"])
                 
         except (KeyError, ValueError, TypeError) as exc:
             return jsonify({"error": f"Invalid request payload: {exc}"}), 400
@@ -101,7 +124,17 @@ def main() -> None:
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=6801)
     parser.add_argument("--debug", action="store_true")
+    parser.add_argument(
+        "--show-access-log",
+        action="store_true",
+        help="Show Flask/Werkzeug access logs (disabled by default).",
+    )
     args = parser.parse_args()
+
+    if not args.show_access_log:
+        werkzeug_logger = logging.getLogger("werkzeug")
+        werkzeug_logger.setLevel(logging.ERROR)
+        werkzeug_logger.propagate = False
 
     merger = _build_merger(config_path=args.config, correlation_path=args.correlation)
     app = create_app(merger)

@@ -1,7 +1,13 @@
 from __future__ import annotations
 
+import json
+import logging
 import math
+import os
+import time
+import uuid
 from copy import deepcopy
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from utils.data_utils import (
@@ -14,11 +20,17 @@ from utils.data_utils import (
     SensorType,
     TrackHistory,
 )
+from utils.DTW import dtw_distance
 
 try:
     from scipy.optimize import linear_sum_assignment  # type: ignore
 except Exception:  # pragma: no cover - optional dependency
     linear_sum_assignment = None
+
+try:
+    import matplotlib.pyplot as plt  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    plt = None
 
 
 class PerceptionMerger:
@@ -33,10 +45,112 @@ class PerceptionMerger:
         self.merge_mode = self.config.default_merge_mode
         self.track_memory: Dict[Tuple[int, int, int], TrackHistory] = {}
         self._next_temp_id = -1
+        self.logger = logging.getLogger("PerceptionMerger")
+        if not self.logger.handlers:
+            self.logger.addHandler(logging.NullHandler())
+        self._file_logger = self._build_file_logger()
+        self._last_frame: Optional[PerceptionFrame] = None
+        self._last_global_items: Optional[List[ObjectItem]] = None
+        self._last_result: Optional[MergeResult] = None
 
     def set_merge_mode(self, merge_mode: str) -> None:
         """设置默认融合模式（可被单次请求覆盖）。"""
         self.merge_mode = merge_mode
+
+    def set_logger(self, logger: logging.Logger) -> None:
+        """设置融合器日志实例。
+
+        Args:
+            logger (logging.Logger): 外部传入的 logger，用于输出 debug/info/error 日志。
+        Returns:
+            None: 无返回值，直接替换内部 logger。
+        """
+        self.logger = logger
+
+    def _build_file_logger(self) -> logging.Logger:
+        """构建用于落盘的文件日志器。
+
+        Args:
+            None: 不需要输入参数。
+        Returns:
+            logging.Logger: 仅写入 `logs/时间戳.txt` 的 logger 实例。
+        """
+        timestamp_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        logs_dir = os.path.join(os.getcwd(), "logs")
+        os.makedirs(logs_dir, exist_ok=True)
+        file_path = os.path.join(logs_dir, f"{timestamp_str}.txt")
+        logger_name = f"PerceptionMergerFile.{id(self)}"
+        file_logger = logging.getLogger(logger_name)
+        for old_handler in list(file_logger.handlers):
+            file_logger.removeHandler(old_handler)
+            old_handler.close()
+        file_logger.propagate = False
+        file_logger.setLevel(logging.DEBUG)
+        handler = logging.FileHandler(file_path, encoding="utf-8")
+        handler.setLevel(logging.DEBUG)
+        handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+        file_logger.addHandler(handler)
+        return file_logger
+
+    def _log_debug(self, message: str, *args: Any) -> None:
+        """同时向外部 logger 与文件 logger 记录 debug 日志。
+
+        Args:
+            message (str): 日志模板字符串。
+            *args (Any): 模板参数。
+        Returns:
+            None: 无返回值，直接写日志。
+        """
+        self.logger.debug(message, *args)
+        self._file_logger.debug(message, *args)
+
+    def _log_info(self, message: str, *args: Any) -> None:
+        """同时向外部 logger 与文件 logger 记录 info 日志。
+
+        Args:
+            message (str): 日志模板字符串。
+            *args (Any): 模板参数。
+        Returns:
+            None: 无返回值，直接写日志。
+        """
+        self.logger.info(message, *args)
+        self._file_logger.info(message, *args)
+
+    def _log_info_text(self, message: str, *args: Any) -> None:
+        """记录普通 info 文本到终端与文件。
+
+        Args:
+            message (str): 日志模板字符串。
+            *args (Any): 模板参数。
+        Returns:
+            None: 无返回值，直接写日志。
+        """
+        self.logger.info(message, *args)
+        self._file_logger.info(message, *args)
+
+    def _log_error(self, message: str, *args: Any) -> None:
+        """同时向外部 logger 与文件 logger 记录 error 日志。
+
+        Args:
+            message (str): 日志模板字符串。
+            *args (Any): 模板参数。
+        Returns:
+            None: 无返回值，直接写日志。
+        """
+        self.logger.error(message, *args)
+        self._file_logger.error(message, *args)
+
+    def _log_exception(self, message: str, *args: Any) -> None:
+        """同时向外部 logger 与文件 logger 记录异常堆栈。
+
+        Args:
+            message (str): 日志模板字符串。
+            *args (Any): 模板参数。
+        Returns:
+            None: 无返回值，直接写日志。
+        """
+        self.logger.exception(message, *args)
+        self._file_logger.exception(message, *args)
 
     def load_class_correlation(self, class_correlation: Dict[str, Any]) -> None:
         """加载或替换跨模态类别关联表。"""
@@ -49,34 +163,71 @@ class PerceptionMerger:
         merge_mode: Optional[str] = None,
     ) -> MergeResult:
         """执行单帧融合流程并输出 update/create 操作。"""
-        mode = merge_mode or self.merge_mode
+        received_at = datetime.now(timezone.utc).isoformat()
+        request_id = f"req-{uuid.uuid4().hex[:12]}"
+        started = time.perf_counter()
+        try:
+            mode = merge_mode or self.merge_mode
 
-        # 全局目标记录时空对齐
-        aligned_items = self._align_global_objects(global_obj_items, perception_frame.timestamp)
+            # 全局目标记录时空对齐
+            aligned_items = self._align_global_objects(global_obj_items, perception_frame.timestamp)
 
-        # 更新局部目标轨迹
-        self._update_track_memory(perception_frame)
+            # 更新局部目标轨迹
+            self._update_track_memory(perception_frame)
 
-        cost_matrix, pair_info = self._build_cost_matrix(perception_frame, aligned_items, mode)
-        assignments, unmatched_det, _unmatched_obj = self._solve_assignment(cost_matrix)
+            cost_matrix, pair_info = self._build_cost_matrix(perception_frame, aligned_items, mode)
+            assignments, unmatched_det, _unmatched_obj = self._solve_assignment(cost_matrix)
 
-        result = self._fuse_matches(
-            perception_frame=perception_frame,
-            aligned_items=aligned_items,
-            assignments=assignments,
-            unmatched_det=unmatched_det,
-            pair_info=pair_info,
-            mode=mode,
-        )
-        result.debug_info.update(
-            {
-                "mode": mode,
-                "num_detections": len(perception_frame.detections),
-                "num_global_objects": len(aligned_items),
-                "num_assignments": len(assignments),
-            }
-        )
-        return result
+            result = self._fuse_matches(
+                perception_frame=perception_frame,
+                aligned_items=aligned_items,
+                assignments=assignments,
+                unmatched_det=unmatched_det,
+                pair_info=pair_info,
+                mode=mode,
+            )
+            result.debug_info.update(
+                {
+                    "mode": mode,
+                    "num_detections": len(perception_frame.detections),
+                    "num_global_objects": len(aligned_items),
+                    "num_assignments": len(assignments),
+                }
+            )
+            self._last_frame = deepcopy(perception_frame)
+            self._last_global_items = [deepcopy(item) for item in global_obj_items]
+            self._last_result = deepcopy(result)
+            
+            latency_ms = (time.perf_counter() - started) * 1000.0
+            self._log_info_text(
+                "Received %d perception results and %d global objects, merged to %d updates and %d creates. Process %f ms",
+                len(perception_frame.detections),
+                len(global_obj_items),
+                len(result.update_ops),
+                len(result.create_ops),
+                round(latency_ms, 3)
+            )
+            
+            self._log_event(
+                level="info_file",
+                event="merger_summary",
+                received_at=received_at,
+                request_id=request_id,
+                api="merge_frame",
+                merge_mode=mode,
+                uav_id=perception_frame.uav_id,
+                sensor_type=perception_frame.sensor_type,
+                frame_timestamp=perception_frame.timestamp,
+                num_detections=len(perception_frame.detections),
+                num_global_objects=len(global_obj_items),
+                num_update_ops=len(result.update_ops),
+                num_create_ops=len(result.create_ops),
+                latency_ms=round(latency_ms, 3),
+            )
+            return result
+        except Exception:
+            self._log_exception("merge_frame failed at %s", received_at)
+            raise
 
     def merge_batch(
         self,
@@ -85,26 +236,220 @@ class PerceptionMerger:
         merge_mode: Optional[str] = None,
     ) -> MergeResult:
         """按时间顺序融合多帧数据并聚合输出。"""
-        mode = merge_mode or self.merge_mode
-        shadow_items = [deepcopy(item) for item in global_obj_items]
-        aggregate = MergeResult()
+        received_at = datetime.now(timezone.utc).isoformat()
+        request_id = f"req-{uuid.uuid4().hex[:12]}"
+        started = time.perf_counter()
+        try:
+            mode = merge_mode or self.merge_mode
+            shadow_items = [deepcopy(item) for item in global_obj_items]
+            aggregate = MergeResult()
 
-        for frame in perception_frames:
-            frame_result = self.merge_frame(frame, shadow_items, merge_mode=mode)
-            aggregate.update_ops.extend(frame_result.update_ops)
-            aggregate.create_ops.extend(frame_result.create_ops)
-            aggregate.alerts.extend(frame_result.alerts)
-            self._apply_ops_to_shadow(shadow_items, frame_result)
+            for frame in perception_frames:
+                frame_result = self.merge_frame(frame, shadow_items, merge_mode=mode)
+                aggregate.update_ops.extend(frame_result.update_ops)
+                aggregate.create_ops.extend(frame_result.create_ops)
+                aggregate.alerts.extend(frame_result.alerts)
+                self._apply_ops_to_shadow(shadow_items, frame_result)
 
-        aggregate.debug_info.update(
-            {
-                "mode": mode,
-                "num_frames": len(perception_frames),
-                "num_update_ops": len(aggregate.update_ops),
-                "num_create_ops": len(aggregate.create_ops),
-            }
-        )
-        return aggregate
+            aggregate.debug_info.update(
+                {
+                    "mode": mode,
+                    "num_frames": len(perception_frames),
+                    "num_update_ops": len(aggregate.update_ops),
+                    "num_create_ops": len(aggregate.create_ops),
+                }
+            )
+            num_det = sum(len(frame.detections) for frame in perception_frames)
+            latency_ms = (time.perf_counter() - started) * 1000.0
+            self._log_info_text(
+                "Received %d perception results and %d global objects, merged to %d updates and %d creates. Process %f ms",
+                num_det,
+                len(global_obj_items),
+                len(aggregate.update_ops),
+                len(aggregate.create_ops),
+                round(latency_ms, 3),
+            )
+            self._log_event(
+                level="info_file",
+                event="merger_summary",
+                received_at=received_at,
+                request_id=request_id,
+                api="merge_batch",
+                merge_mode=mode,
+                num_frames=len(perception_frames),
+                num_detections=num_det,
+                num_global_objects=len(global_obj_items),
+                num_update_ops=len(aggregate.update_ops),
+                num_create_ops=len(aggregate.create_ops),
+                latency_ms=round(latency_ms, 3),
+            )
+            return aggregate
+        except Exception:
+            self._log_exception("merge_batch failed at %s", received_at)
+            raise
+
+    def render(
+        self,
+        perception_frame: Optional[PerceptionFrame] = None,
+        global_obj_items: Optional[Sequence[ObjectItem]] = None,
+        merge_result: Optional[MergeResult] = None,
+        output_path: Optional[str] = None,
+        show: bool = False,
+    ) -> Dict[str, Any]:
+        """绘制一次融合过程的临时可视化。
+
+        Args:
+            perception_frame (Optional[PerceptionFrame]): 本次融合输入感知帧；为 None 时使用最近一次 merge_frame 输入。
+            global_obj_items (Optional[Sequence[ObjectItem]]): 融合时的全局目标记录；为 None 时使用最近缓存。
+            merge_result (Optional[MergeResult]): 融合结果；为 None 时使用最近缓存。
+            output_path (Optional[str]): 可选图片输出路径（例如 png）。
+            show (bool): 是否弹出窗口显示图像。
+        Returns:
+            Dict[str, Any]: 渲染元数据，包括状态、输出路径、统计信息。
+        """
+        frame = perception_frame or self._last_frame
+        globals_input = list(global_obj_items) if global_obj_items is not None else self._last_global_items
+        result = merge_result or self._last_result
+        if frame is None or globals_input is None or result is None:
+            raise ValueError("render requires explicit inputs or a previous merge_frame context.")
+
+        aligned_items = self._align_global_objects(globals_input, frame.timestamp)
+        global_pos_by_id = {item.global_id: item.position for item in aligned_items}
+        render_meta = {
+            "num_detections": len(frame.detections),
+            "num_global_objects": len(aligned_items),
+            "num_update_ops": len(result.update_ops),
+            "num_create_ops": len(result.create_ops),
+            "output_path": output_path,
+        }
+
+        if plt is None:
+            self._log_error("render skipped: matplotlib is not available.")
+            return {"status": "matplotlib_unavailable", **render_meta}
+
+        fig, ax = plt.subplots(figsize=(9, 7))
+        ax.set_title("PerceptionMerger Render")
+        ax.set_xlabel("X")
+        ax.set_ylabel("Y")
+
+        # 全局目标记录：位置 + 历史轨迹
+        for item in aligned_items:
+            gx, gy = item.position[0], item.position[1]
+            ax.scatter([gx], [gy], c="#1f77b4", s=35, marker="o")
+            ax.text(gx + 1.0, gy + 1.0, f"G{item.global_id}", color="#1f77b4", fontsize=8)
+            if len(item.trajectory) >= 2:
+                tx = [p[0] for p in item.trajectory[-30:]]
+                ty = [p[1] for p in item.trajectory[-30:]]
+                ax.plot(tx, ty, color="#9ecae1", linewidth=1)
+
+        # 即时感知结果：位置 + 类别 + track_id + track_memory轨迹
+        for det in frame.detections:
+            dx, dy = det.position[0], det.position[1]
+            ax.scatter([dx], [dy], c="#ff7f0e", s=35, marker="x")
+            ax.text(dx + 1.0, dy - 1.0, f"C{det.class_id}/T{det.track_id}", color="#ff7f0e", fontsize=8)
+            if det.track_id >= 0:
+                key = (frame.uav_id, frame.sensor_type, det.track_id)
+                history = self.track_memory.get(key)
+                if history is not None and len(history.points) >= 2:
+                    hx = [p[0] for p in history.points]
+                    hy = [p[1] for p in history.points]
+                    ax.plot(hx, hy, color="#ffbb78", linestyle="--", linewidth=1)
+
+        # 融合关联结果：成功关联的感知结果连向全局目标
+        for op in result.update_ops:
+            obs = op.payload.get("observation", {})
+            det_pos = obs.get("position")
+            if not det_pos:
+                continue
+            target_pos = global_pos_by_id.get(int(op.target_id))
+            if target_pos is None:
+                continue
+            ax.plot(
+                [float(det_pos[0]), float(target_pos[0])],
+                [float(det_pos[1]), float(target_pos[1])],
+                color="#d62728",
+                linestyle=":",
+                linewidth=1.3,
+            )
+
+        ax.grid(alpha=0.25)
+        ax.set_aspect("equal", adjustable="box")
+        if output_path:
+            fig.savefig(output_path, dpi=120, bbox_inches="tight")
+        if show:
+            plt.show()
+        else:
+            plt.close(fig)
+        return {"status": "ok", **render_meta}
+
+    def _log_event(self, level: str, **record: Any) -> None:
+        """输出固定字段结构化日志事件。
+
+        Args:
+            level (str): 日志等级（debug/info/error）。
+            **record (Any): 结构化字段。
+        Returns:
+            None: 无返回值，直接写日志。
+        """
+        line = json.dumps(record, ensure_ascii=False, sort_keys=True)
+        if level == "debug":
+            self._log_debug("MERGER_EVENT %s", line)
+            return
+        if level == "info":
+            self._log_info("MERGER_EVENT %s", line)
+            return
+        if level == "info_file":
+            self._file_logger.info("MERGER_EVENT %s", line)
+            return
+        self._log_error("MERGER_EVENT %s", line)
+
+    def _log_input_snapshot(
+        self,
+        api_name: str,
+        received_at: str,
+        request_id: str,
+        payload: Dict[str, Any],
+    ) -> None:
+        """以 debug 级别记录可复现输入快照。
+
+        Args:
+            api_name (str): 调用接口名（merge_frame 或 merge_batch）。
+            received_at (str): 接收时间（ISO8601）。
+            request_id (str): 请求关联 ID。
+            payload (Dict[str, Any]): 输入内容快照。
+        Returns:
+            None: 无返回值，直接写日志。
+        """
+        header = {"event": "merger_input_meta", "received_at": received_at, "request_id": request_id, "api": api_name, "merge_mode": payload.get("merge_mode")}
+        self._log_event(level="debug", **header)
+        if "perception_frame" in payload:
+            frame = payload["perception_frame"]
+            self._log_event(
+                level="debug",
+                event="merger_input_perception_frame",
+                received_at=received_at,
+                request_id=request_id,
+                uav_id=frame.get("uav_id"),
+                sensor_type=frame.get("sensor_type"),
+                frame_timestamp=frame.get("timestamp"),
+                perception_frame=frame,
+            )
+        if "perception_frames" in payload:
+            self._log_event(
+                level="debug",
+                event="merger_input_perception_frames",
+                received_at=received_at,
+                request_id=request_id,
+                perception_frames=payload["perception_frames"],
+            )
+        if "global_obj_items" in payload:
+            self._log_event(
+                level="debug",
+                event="merger_input_global_obj_items",
+                received_at=received_at,
+                request_id=request_id,
+                global_obj_items=payload["global_obj_items"],
+            )
 
     def _align_global_objects(
         self,
@@ -381,8 +726,17 @@ class PerceptionMerger:
         if direct is not None:
             return direct == class_id
 
+        # class_correlation: 
+        # 索引顺序：  sensor_type - class_id - sensor_type - List[class_id]
+        # cc[sensor_type] 为指定模态传感器下，各个目标类别
+        # Dict[class_id] = Dict[sensor_type]
+
+        # 本模态传感器下所有可识别目标类别
         corr_sensor = self.class_correlation.get(str(sensor_type), {})
+        
+        # 本模态指定目标类型class_id下，在其他模态传感器中的关联类别
         corr_classes = corr_sensor.get(str(class_id), {})
+
         for obj_sensor, obj_class in obj.class_by_sensor.items():
             mapped = corr_classes.get(str(obj_sensor), [])
             if obj_class in mapped:
@@ -454,21 +808,76 @@ class PerceptionMerger:
         return 0.5 * (1 - cos_val)
 
     def _track_cost(self, frame: PerceptionFrame, det: Detection, obj: ObjectItem) -> float:
-        """局部轨迹与全局轨迹方向一致性代价。"""
+        """基于全轨迹 DTW 的轨迹相似度代价。"""
         if det.track_id < 0:
             return 0.5
         key = (frame.uav_id, frame.sensor_type, det.track_id)
         history = self.track_memory.get(key)
-        if history is None or len(history.points) < 2 or len(obj.trajectory) < 2:
+        if history is None or len(history.points) < 2:
             return 0.5
-        local_vec = self._vec_sub(history.points[-1], history.points[-2])
-        global_vec = self._vec_sub(obj.trajectory[-1], obj.trajectory[-2])
-        local_norm = self._norm(local_vec)
-        global_norm = self._norm(global_vec)
-        if local_norm < 1e-6 or global_norm < 1e-6:
+
+        local_points = [tuple(p) for p in history.points]
+        local_ts = [float(t) for t in history.timestamps]
+        if not local_ts:
             return 0.5
-        cos_val = max(-1.0, min(1.0, self._dot(local_vec, global_vec) / (local_norm * global_norm)))
-        return 0.5 * (1 - cos_val)
+        ts_min = min(local_ts)
+        ts_max = max(local_ts)
+
+        global_points = self._extract_global_track_points_by_time(obj=obj, ts_min=ts_min, ts_max=ts_max)
+        if len(global_points) < 2:
+            return 0.5
+
+        local_norm = self._normalize_track_points(local_points)
+        global_norm = self._normalize_track_points(global_points)
+        dist = dtw_distance(local_norm, global_norm)
+        local_len = self._trajectory_path_length(local_norm)
+        global_len = self._trajectory_path_length(global_norm)
+        scale = max(local_len, global_len, 1.0)
+        if not math.isfinite(dist) or scale <= 1e-6:
+            return 0.5
+        normalized = min(1.0, dist / scale)
+        length_penalty = abs(len(local_norm) - len(global_norm)) / max(len(local_norm), len(global_norm), 1)
+        return min(1.0, 0.9 * normalized + 0.1 * length_penalty)
+
+    def _extract_global_track_points_by_time(
+        self,
+        obj: ObjectItem,
+        ts_min: float,
+        ts_max: float,
+    ) -> List[Tuple[float, float, float]]:
+        """提取全局目标在指定时间窗内的历史观测轨迹点。"""
+        points: List[Tuple[float, float, float]] = []
+        observations_sorted = sorted(
+            obj.observations,
+            key=lambda obs: float(obs.get("timestamp", obj.timestamp)),
+        )
+        for obs in observations_sorted:
+            obs_ts = float(obs.get("timestamp", obj.timestamp))
+            if obs_ts < ts_min or obs_ts > ts_max:
+                continue
+            pos = obs.get("position")
+            if isinstance(pos, (list, tuple)) and len(pos) >= 3:
+                points.append((float(pos[0]), float(pos[1]), float(pos[2])))
+        return points
+
+    def _normalize_track_points(
+        self,
+        points: Sequence[Tuple[float, float, float]],
+    ) -> List[Tuple[float, float, float]]:
+        """将轨迹平移到统一起点，提升轨迹形状相似性评估稳定性。"""
+        if not points:
+            return []
+        origin = points[0]
+        return [(p[0] - origin[0], p[1] - origin[1], p[2] - origin[2]) for p in points]
+
+    def _trajectory_path_length(self, points: Sequence[Tuple[float, float, float]]) -> float:
+        """计算轨迹折线总长度。"""
+        if len(points) < 2:
+            return 0.0
+        total = 0.0
+        for i in range(1, len(points)):
+            total += self._norm(self._vec_sub(points[i], points[i - 1]))
+        return total
 
     def _visibility_cost(
         self,
