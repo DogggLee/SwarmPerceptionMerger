@@ -83,7 +83,7 @@
   "create_ops": [
     {
       "operation": "create",
-      "target_id": -1,
+      "target_id": 102,
       "payload": {
         "timestamp": 11.0,
         "position": [300.0, 400.0, 0.0],

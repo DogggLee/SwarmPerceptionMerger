@@ -38,13 +38,28 @@ class PerceptionMerger:
         self,
         config: Optional[MergeConfig] = None,
         class_correlation: Optional[Dict[str, Any]] = None,
+        names_mapping: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """初始化融合器配置、类别关联和局部轨迹缓存。"""
+        """初始化融合器配置、类别关联和局部轨迹缓存。
+
+        Args:
+            config (Optional[MergeConfig]): 融合参数配置对象，空值时使用默认配置。
+            class_correlation (Optional[Dict[str, Any]]): 类别关联表，支持纯 int 或纯字符串命名两种键值形式。
+            names_mapping (Optional[Dict[str, Any]]): 名称映射表（通常来自 names.json），用于 int 与字符串互转。
+        Returns:
+            None: 无返回值，完成融合器实例初始化。
+        """
         self.config = config or MergeConfig()
-        self.class_correlation: Dict[str, Any] = class_correlation or {}
+        self.class_correlation: Dict[int, Dict[int, Dict[int, List[int]]]] = {}
+        self.sensor_id_to_name: Dict[int, str] = {item.value: item.name for item in SensorType}
+        self.sensor_name_to_id: Dict[str, int] = {name: idx for idx, name in self.sensor_id_to_name.items()}
+        self.class_id_to_name: Dict[int, str] = {}
+        self.class_name_to_id: Dict[str, int] = {}
+        self.class_id_to_name_by_sensor: Dict[int, Dict[int, str]] = {}
+        self.class_name_to_id_by_sensor: Dict[int, Dict[str, int]] = {}
         self.merge_mode = self.config.default_merge_mode
         self.track_memory: Dict[Tuple[int, int, int], TrackHistory] = {}
-        self._next_temp_id = -1
+        self._next_global_id = 0
         self.logger = logging.getLogger("PerceptionMerger")
         if not self.logger.handlers:
             self.logger.addHandler(logging.NullHandler())
@@ -52,6 +67,9 @@ class PerceptionMerger:
         self._last_frame: Optional[PerceptionFrame] = None
         self._last_global_items: Optional[List[ObjectItem]] = None
         self._last_result: Optional[MergeResult] = None
+        if names_mapping:
+            self.load_names_mapping(names_mapping)
+        self.load_class_correlation(class_correlation or {})
 
     def set_merge_mode(self, merge_mode: str) -> None:
         """设置默认融合模式（可被单次请求覆盖）。"""
@@ -152,9 +170,253 @@ class PerceptionMerger:
         self.logger.exception(message, *args)
         self._file_logger.exception(message, *args)
 
+    def load_names_mapping(self, names_mapping: Dict[str, Any]) -> None:
+        """加载 names 映射并建立 sensor/class 的双向索引。
+
+        Args:
+            names_mapping (Dict[str, Any]): names.json 原始内容，需包含 sensor_type 与 class_id 的名称映射。
+        Returns:
+            None: 无返回值，更新内部映射索引供后续关联表转换使用。
+        """
+        if not names_mapping:
+            return
+        sensor_table_raw = (
+            names_mapping.get("sensor_type")
+            or names_mapping.get("sensor_types")
+            or names_mapping.get("sensor")
+            or names_mapping.get("sensors")
+            or names_mapping.get("sensor_type_names")
+            or {}
+        )
+        class_table_raw = (
+            names_mapping.get("class_id_by_sensor")
+            or names_mapping.get("class_names_by_sensor")
+            or names_mapping.get("classes_by_sensor")
+            or names_mapping.get("class_by_sensor")
+            or {}
+        )
+        class_table_fallback_raw = (
+            names_mapping.get("class_id")
+            or names_mapping.get("class_ids")
+            or names_mapping.get("class")
+            or names_mapping.get("classes")
+            or names_mapping.get("class_names")
+            or {}
+        )
+        sensor_id_to_name, sensor_name_to_id = self._normalize_name_table(sensor_table_raw)
+        if sensor_id_to_name:
+            self.sensor_id_to_name.update(sensor_id_to_name)
+        if sensor_name_to_id:
+            self.sensor_name_to_id.update(sensor_name_to_id)
+        if class_table_raw:
+            self._load_sensor_class_name_mapping(class_table_raw)
+        elif self._is_sensor_scoped_class_table(class_table_fallback_raw):
+            self._load_sensor_class_name_mapping(class_table_fallback_raw)
+            class_table_fallback_raw = {}
+        class_id_to_name, class_name_to_id = self._normalize_name_table(class_table_fallback_raw)
+        if class_id_to_name:
+            self.class_id_to_name.update(class_id_to_name)
+        if class_name_to_id:
+            self.class_name_to_id.update(class_name_to_id)
+
+    def _is_sensor_scoped_class_table(self, mapping: Any) -> bool:
+        """判断类别映射表是否为“按传感器分组”结构。
+
+        Args:
+            mapping (Any): 待判断映射对象。
+        Returns:
+            bool: 若为 `sensor -> (class_id/name 映射)` 结构则返回 True。
+        """
+        if not isinstance(mapping, dict) or not mapping:
+            return False
+        return all(isinstance(v, dict) for v in mapping.values())
+
+    def _load_sensor_class_name_mapping(self, mapping: Dict[str, Any]) -> None:
+        """加载按传感器维度拆分的类别名称映射。
+
+        Args:
+            mapping (Dict[str, Any]): 传感器到类别映射的表，支持 sensor key 为 int 或字符串名称。
+        Returns:
+            None: 无返回值，更新按传感器维度的类别双向索引。
+        """
+        for raw_sensor, raw_class_table in mapping.items():
+            if not isinstance(raw_class_table, dict):
+                continue
+            sensor_type = self._sensor_name_to_int(raw_sensor)
+            id_to_name, name_to_id = self._normalize_name_table(raw_class_table)
+            if id_to_name:
+                self.class_id_to_name_by_sensor.setdefault(sensor_type, {}).update(id_to_name)
+            if name_to_id:
+                self.class_name_to_id_by_sensor.setdefault(sensor_type, {}).update(name_to_id)
+
     def load_class_correlation(self, class_correlation: Dict[str, Any]) -> None:
-        """加载或替换跨模态类别关联表。"""
-        self.class_correlation = class_correlation or {}
+        """加载并标准化跨模态类别关联表。
+
+        Args:
+            class_correlation (Dict[str, Any]): 原始类别关联表，可为 int 形式或字符串命名形式。
+        Returns:
+            None: 无返回值，内部统一转换为 int 关联表并打印字符串可读版本。
+        """
+        normalized = self._normalize_class_correlation(class_correlation or {})
+        self.class_correlation = normalized
+        printable = self._stringify_class_correlation(normalized)
+        self._log_info_text(
+            "Loaded class_correlation (string view): %s",
+            json.dumps(printable, ensure_ascii=False, sort_keys=True),
+        )
+
+    def _normalize_name_table(self, mapping: Any) -> Tuple[Dict[int, str], Dict[str, int]]:
+        """将名称映射表标准化为 int->str 与 str->int 双向映射。
+
+        Args:
+            mapping (Any): 原始映射对象，支持 `{\"0\": \"RGB\"}` 或 `{\"RGB\": 0}` 两种形式。
+        Returns:
+            Tuple[Dict[int, str], Dict[str, int]]: 规范化后的双向映射表。
+        """
+        id_to_name: Dict[int, str] = {}
+        name_to_id: Dict[str, int] = {}
+        if not isinstance(mapping, dict):
+            return id_to_name, name_to_id
+        for raw_key, raw_value in mapping.items():
+            key_int = self._try_parse_int(raw_key)
+            value_int = self._try_parse_int(raw_value)
+            if key_int is not None and isinstance(raw_value, str):
+                name = raw_value.strip()
+                if name:
+                    id_to_name[key_int] = name
+                    name_to_id[name] = key_int
+                continue
+            if isinstance(raw_key, str) and raw_key.strip() and value_int is not None:
+                name = raw_key.strip()
+                id_to_name[value_int] = name
+                name_to_id[name] = value_int
+        return id_to_name, name_to_id
+
+    def _try_parse_int(self, value: Any) -> Optional[int]:
+        """尝试将输入解析为 int。
+
+        Args:
+            value (Any): 待解析值，支持 int 或字符串数字。
+        Returns:
+            Optional[int]: 解析成功返回整数，否则返回 None。
+        """
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str):
+            text = value.strip()
+            if text.startswith("-"):
+                digit = text[1:]
+            else:
+                digit = text
+            if digit.isdigit():
+                return int(text)
+        return None
+
+    def _sensor_name_to_int(self, raw_sensor: Any) -> int:
+        """将传感器键统一转换为 int sensor_type。
+
+        Args:
+            raw_sensor (Any): 传感器标识，可能是 int 数字或字符串名称。
+        Returns:
+            int: 标准化后的传感器类型整数值。
+        """
+        sensor_int = self._try_parse_int(raw_sensor)
+        if sensor_int is not None:
+            return sensor_int
+        if isinstance(raw_sensor, str):
+            raw_key = raw_sensor.strip()
+            if raw_key in self.sensor_name_to_id:
+                return self.sensor_name_to_id[raw_key]
+            upper_key = raw_key.upper()
+            if upper_key in self.sensor_name_to_id:
+                return self.sensor_name_to_id[upper_key]
+        raise ValueError(f"Unknown sensor key: {raw_sensor}")
+
+    def _class_name_to_int(self, raw_class: Any, sensor_type: Optional[int] = None) -> int:
+        """将类别键统一转换为 int class_id。
+
+        Args:
+            raw_class (Any): 类别标识，可能是 int 数字或字符串名称。
+            sensor_type (Optional[int]): 类别所属传感器类型；传入后优先按该模态映射解析。
+        Returns:
+            int: 标准化后的类别整数值。
+        """
+        class_int = self._try_parse_int(raw_class)
+        if class_int is not None:
+            return class_int
+        if isinstance(raw_class, str):
+            raw_key = raw_class.strip()
+            if sensor_type is not None:
+                sensor_map = self.class_name_to_id_by_sensor.get(sensor_type, {})
+                if raw_key in sensor_map:
+                    return sensor_map[raw_key]
+            if raw_key in self.class_name_to_id:
+                return self.class_name_to_id[raw_key]
+        raise ValueError(f"Unknown class key: {raw_class}")
+
+    def _class_int_to_name(self, class_id: int, sensor_type: Optional[int] = None) -> str:
+        """将 int class_id 转为可读名称。
+
+        Args:
+            class_id (int): 类别整数 ID。
+            sensor_type (Optional[int]): 类别所属传感器类型；传入后优先按该模态映射名称。
+        Returns:
+            str: 映射到的名称；若无映射则回退为数字字符串。
+        """
+        if sensor_type is not None:
+            sensor_map = self.class_id_to_name_by_sensor.get(sensor_type, {})
+            if class_id in sensor_map:
+                return sensor_map[class_id]
+        return self.class_id_to_name.get(class_id, str(class_id))
+
+    def _normalize_class_correlation(self, class_correlation: Dict[str, Any]) -> Dict[int, Dict[int, Dict[int, List[int]]]]:
+        """将类别关联表转换为内部统一的 int 结构。
+
+        Args:
+            class_correlation (Dict[str, Any]): 原始类别关联表，键值可为 int/str 混合表示。
+        Returns:
+            Dict[int, Dict[int, Dict[int, List[int]]]]: 标准化后的整数关联表。
+        """
+        normalized: Dict[int, Dict[int, Dict[int, List[int]]]] = {}
+        for raw_src_sensor, raw_cls_map in (class_correlation or {}).items():
+            src_sensor = self._sensor_name_to_int(raw_src_sensor)
+            if not isinstance(raw_cls_map, dict):
+                continue
+            sensor_bucket = normalized.setdefault(src_sensor, {})
+            for raw_src_class, raw_dst_sensor_map in raw_cls_map.items():
+                src_class = self._class_name_to_int(raw_src_class, sensor_type=src_sensor)
+                if not isinstance(raw_dst_sensor_map, dict):
+                    continue
+                class_bucket = sensor_bucket.setdefault(src_class, {})
+                for raw_dst_sensor, raw_dst_classes in raw_dst_sensor_map.items():
+                    dst_sensor = self._sensor_name_to_int(raw_dst_sensor)
+                    if not isinstance(raw_dst_classes, list):
+                        continue
+                    dst_class_list: List[int] = []
+                    for raw_dst_class in raw_dst_classes:
+                        dst_class_list.append(self._class_name_to_int(raw_dst_class, sensor_type=dst_sensor))
+                    class_bucket[dst_sensor] = dst_class_list
+        return normalized
+
+    def _stringify_class_correlation(self, class_correlation: Dict[int, Dict[int, Dict[int, List[int]]]]) -> Dict[str, Dict[str, Dict[str, List[str]]]]:
+        """将 int 关联表转换为字符串可读形式，用于日志打印。
+
+        Args:
+            class_correlation (Dict[int, Dict[int, Dict[int, List[int]]]]): 内部整数关联表。
+        Returns:
+            Dict[str, Dict[str, Dict[str, List[str]]]]: 名称化后的字符串关联表。
+        """
+        result: Dict[str, Dict[str, Dict[str, List[str]]]] = {}
+        for src_sensor, class_map in class_correlation.items():
+            src_sensor_name = self.sensor_id_to_name.get(src_sensor, str(src_sensor))
+            sensor_bucket: Dict[str, Dict[str, List[str]]] = result.setdefault(src_sensor_name, {})
+            for src_class, dst_sensor_map in class_map.items():
+                src_class_name = self._class_int_to_name(src_class, sensor_type=src_sensor)
+                class_bucket: Dict[str, List[str]] = sensor_bucket.setdefault(src_class_name, {})
+                for dst_sensor, dst_classes in dst_sensor_map.items():
+                    dst_sensor_name = self.sensor_id_to_name.get(dst_sensor, str(dst_sensor))
+                    class_bucket[dst_sensor_name] = [self._class_int_to_name(cid, sensor_type=dst_sensor) for cid in dst_classes]
+        return result
 
     def merge_frame(
         self,
@@ -168,6 +430,7 @@ class PerceptionMerger:
         started = time.perf_counter()
         try:
             mode = merge_mode or self.merge_mode
+            self._sync_next_global_id(global_obj_items)
 
             # 全局目标记录时空对齐
             aligned_items = self._align_global_objects(global_obj_items, perception_frame.timestamp)
@@ -603,7 +866,18 @@ class PerceptionMerger:
         pair_info: Dict[Tuple[int, int], Dict[str, float]],
         mode: str,
     ) -> MergeResult:
-        """根据匹配结果生成更新操作与新增操作。"""
+        """根据匹配结果生成更新操作与新增操作。
+
+        Args:
+            perception_frame (PerceptionFrame): 当前时刻的输入感知帧。
+            aligned_items (Sequence[ObjectItem]): 已按感知时刻对齐的全局目标记录。
+            assignments (Sequence[Tuple[int, int]]): 检测索引到全局目标索引的匹配对。
+            unmatched_det (Sequence[int]): 未匹配检测索引列表。
+            pair_info (Dict[Tuple[int, int], Dict[str, float]]): 每个匹配候选的代价明细。
+            mode (str): 当前融合模式字符串。
+        Returns:
+            MergeResult: 包含 update/create 操作、告警与调试信息的融合结果。
+        """
         result = MergeResult()
         for det_idx, obj_idx in assignments:
             det = perception_frame.detections[det_idx]
@@ -641,7 +915,7 @@ class PerceptionMerger:
             if perception_frame.sensor_type == SensorType.ELEC.value:
                 # ELEC 为方位主导观测，不允许直接新建目标。
                 continue
-            temp_id = self._allocate_temp_id()
+            global_id = self._allocate_global_id()
             payload = {
                 "timestamp": perception_frame.timestamp,
                 "position": list(det.position),
@@ -652,7 +926,7 @@ class PerceptionMerger:
                 "spatial_valid": True,
             }
             result.create_ops.append(
-                MergeOperation(operation="create", target_id=temp_id, payload=payload)
+                MergeOperation(operation="create", target_id=global_id, payload=payload)
             )
 
         if perception_frame.sensor_type == SensorType.ELEC.value and unmatched_det:
@@ -732,13 +1006,13 @@ class PerceptionMerger:
         # Dict[class_id] = Dict[sensor_type]
 
         # 本模态传感器下所有可识别目标类别
-        corr_sensor = self.class_correlation.get(str(sensor_type), {})
+        corr_sensor = self.class_correlation.get(sensor_type, {})
         
         # 本模态指定目标类型class_id下，在其他模态传感器中的关联类别
-        corr_classes = corr_sensor.get(str(class_id), {})
+        corr_classes = corr_sensor.get(class_id, {})
 
         for obj_sensor, obj_class in obj.class_by_sensor.items():
-            mapped = corr_classes.get(str(obj_sensor), [])
+            mapped = corr_classes.get(int(obj_sensor), [])
             if obj_class in mapped:
                 return True
         return False
@@ -1054,11 +1328,28 @@ class PerceptionMerger:
                 for sk, sv in class_votes.items()
             }
 
-    def _allocate_temp_id(self) -> int:
-        """分配新增目标使用的临时负 ID。"""
-        temp_id = self._next_temp_id
-        self._next_temp_id -= 1
-        return temp_id
+    def _sync_next_global_id(self, global_obj_items: Sequence[ObjectItem]) -> None:
+        """同步下一可用全局 ID，避免与已有全局目标 ID 冲突。
+
+        Args:
+            global_obj_items (Sequence[ObjectItem]): 当前全局目标记录集合，元素中的 `global_id` 为已占用 ID。
+        Returns:
+            None: 无返回值，仅更新内部 `_next_global_id` 游标。
+        """
+        existing_max_id = max((int(item.global_id) for item in global_obj_items), default=-1)
+        self._next_global_id = max(self._next_global_id, existing_max_id + 1)
+
+    def _allocate_global_id(self) -> int:
+        """分配新增目标的全局 ID，默认从 0 开始并按 1 递增。
+
+        Args:
+            None: 无输入参数。
+        Returns:
+            int: 当前分配出的全局目标 ID。
+        """
+        global_id = self._next_global_id
+        self._next_global_id += 1
+        return global_id
 
     @staticmethod
     def _dot(a: Tuple[float, float, float], b: Tuple[float, float, float]) -> float:

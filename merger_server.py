@@ -22,11 +22,16 @@ def _parse_global_objects(raw_items: List[Dict[str, Any]]) -> List[ObjectItem]:
     return [ObjectItem.from_dict(item) for item in raw_items]
 
 
-def _build_merger(config_path: str | None, correlation_path: str | None) -> PerceptionMerger:
+def _build_merger(
+    config_path: str | None,
+    correlation_path: str | None,
+    names_path: str | None,
+) -> PerceptionMerger:
     config_dict = _load_json_file(config_path)
     corr_dict = _load_json_file(correlation_path)
+    names_dict = _load_json_file(names_path)
     config = MergeConfig.from_dict(config_dict)
-    merger = PerceptionMerger(config=config, class_correlation=corr_dict)
+    merger = PerceptionMerger(config=config, class_correlation=corr_dict, names_mapping=names_dict)
     merger.set_logger(_build_console_logger())
     return merger
 
@@ -121,6 +126,12 @@ def main() -> None:
         default="config/class_correlation.json",
         help="Path to class correlation JSON",
     )
+    parser.add_argument(
+        "--names",
+        type=str,
+        default="config/names.json",
+        help="Path to names.json used for int<->string mapping of sensor_type/class_id",
+    )
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=6801)
     parser.add_argument("--debug", action="store_true")
@@ -136,7 +147,7 @@ def main() -> None:
         werkzeug_logger.setLevel(logging.ERROR)
         werkzeug_logger.propagate = False
 
-    merger = _build_merger(config_path=args.config, correlation_path=args.correlation)
+    merger = _build_merger(config_path=args.config, correlation_path=args.correlation, names_path=args.names)
     app = create_app(merger)
     app.run(host=args.host, port=args.port, debug=args.debug)
 

@@ -5,6 +5,45 @@ from utils.data_utils import MergeOperation, MergeResult, ObjectItem
 
 
 class TestGlobalInfoPolicy(unittest.TestCase):
+    def test_apply_merge_result_create_ops_keep_assigned_global_ids(self) -> None:
+        gi = GlobalInfo(valid_observation_count=1, max_unseen_time=4.0, stale_observation_time=10.0)
+        merge_result = MergeResult(
+            create_ops=[
+                MergeOperation(
+                    operation="create",
+                    target_id=0,
+                    payload={
+                        "timestamp": 1.0,
+                        "position": [10.0, 0.0, 0.0],
+                        "velocity": [0.0, 0.0, 0.0],
+                        "observation": {"timestamp": 1.0, "position": [10.0, 0.0, 0.0], "sensor_type": 2},
+                        "class_by_sensor": {"2": 1},
+                        "class_votes": {"2": {"1": 1}},
+                        "spatial_valid": True,
+                    },
+                ),
+                MergeOperation(
+                    operation="create",
+                    target_id=1,
+                    payload={
+                        "timestamp": 1.2,
+                        "position": [20.0, 0.0, 0.0],
+                        "velocity": [0.0, 0.0, 0.0],
+                        "observation": {"timestamp": 1.2, "position": [20.0, 0.0, 0.0], "sensor_type": 2},
+                        "class_by_sensor": {"2": 2},
+                        "class_votes": {"2": {"2": 1}},
+                        "spatial_valid": True,
+                    },
+                ),
+            ]
+        )
+
+        id_map = gi.apply_merge_result(merge_result)
+        self.assertEqual(id_map[0], 0)
+        self.assertEqual(id_map[1], 1)
+        self.assertIsNotNone(gi.get_item(0))
+        self.assertIsNotNone(gi.get_item(1))
+
     def test_predict_updates_state_and_maintains_items(self) -> None:
         gi = GlobalInfo(valid_observation_count=3, max_unseen_time=4.0, stale_observation_time=2.0)
         item = ObjectItem.from_dict(

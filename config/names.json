@@ -1,0 +1,30 @@
+{
+  "sensor_type": {
+    "0": "RADAR",
+    "1": "IF",
+    "2": "RGB",
+    "3": "ELEC"
+  },
+  "class_id_by_sensor": {
+    "RADAR": {
+      "1": "R_TRACK_A",
+      "2": "R_TRACK_B",
+      "3": "R_TRACK_C"
+    },
+    "IF": {
+      "1": "I_CAND_A",
+      "2": "I_CAND_B",
+      "3": "I_CAND_C"
+    },
+    "RGB": {
+      "1": "RGB_CAR",
+      "2": "RGB_TRUCK",
+      "3": "RGB_UAV"
+    },
+    "ELEC": {
+      "1": "EL_PULSE",
+      "2": "EL_CW",
+      "3": "EL_HOP"
+    }
+  }
+}

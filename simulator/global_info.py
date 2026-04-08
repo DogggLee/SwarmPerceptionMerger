@@ -17,7 +17,7 @@ class GlobalInfo:
         self.max_unseen_time = max_unseen_time
         self.stale_observation_time = stale_observation_time
         self.items: Dict[int, ObjectItem] = {}
-        self.max_id = 0
+        self.max_id = -1
         self.current_timestamp = 0.0
 
     def _assign_id(self) -> int:
@@ -27,7 +27,7 @@ class GlobalInfo:
 
     def _add_item(self, obj_item: ObjectItem) -> int:
         """向全局态势中新增目标记录并返回最终 ID。"""
-        if obj_item.global_id <= 0:
+        if obj_item.global_id < 0:
             obj_item.global_id = self._assign_id()
         else:
             self.max_id = max(self.max_id, obj_item.global_id)
@@ -109,10 +109,19 @@ class GlobalInfo:
             }
 
     def apply_create_op(self, op: MergeOperation) -> int:
-        """将新增操作转换为正式目标记录并分配全局 ID。"""
+        """将新增操作转换为正式目标记录并分配或复用全局 ID。
+
+        Args:
+            op (MergeOperation): 新增操作。若 `op.target_id >= 0`，则优先使用该 ID；
+                否则由系统按当前最大 ID 递增分配。
+        Returns:
+            int: 最终写入全局态势的目标 ID。
+        """
         payload = op.payload
+        assigned_id = int(op.target_id) if int(op.target_id) >= 0 else self._assign_id()
+        self.max_id = max(self.max_id, assigned_id)
         item = ObjectItem(
-            global_id=self._assign_id(),
+            global_id=assigned_id,
             position=(
                 float(payload["position"][0]),
                 float(payload["position"][1]),

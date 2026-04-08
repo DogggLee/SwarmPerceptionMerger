@@ -21,6 +21,12 @@ SENSOR_LABELS: Dict[int, str] = {
     2: "RGB",
     3: "ELEC",
 }
+SENSOR_RANGE_COLORS: Dict[int, str] = {
+    SensorType.RADAR.value: "#2a9d8f",
+    SensorType.IF.value: "#f4a261",
+    SensorType.RGB.value: "#457b9d",
+    SensorType.ELEC.value: "#9d4edd",
+}
 
 
 def _load_json(path: str) -> Dict[str, Any]:
@@ -981,12 +987,23 @@ class DemoUI:
         return True
 
     def _draw_sensor_range(self, uav: Dict[str, Any], map_w: float, map_h: float, sensor_available: bool) -> None:
+        """绘制单个 UAV 的传感器感知范围。
+
+        Args:
+            uav (Dict[str, Any]): UAV 状态字典，需包含位置、传感器类型与参数。
+            map_w (float): 地图世界坐标宽度。
+            map_h (float): 地图世界坐标高度。
+            sensor_available (bool): 当前环境下该传感器是否可用。
+        Returns:
+            None: 无返回值，直接在画布上绘制。
+        """
         sensor_type = int(uav.get("sensor_type", 2))
         ux, uy = float(uav["position"][0]), float(uav["position"][1])
         params = uav.get("sensor_params", {})
         yaw_deg = float(uav.get("yaw_deg", 0.0))
-        outline_color = "#95d5b2" if sensor_available else "#6c757d"
-        dash_style = None if sensor_available else (4, 3)
+        sensor_color = SENSOR_RANGE_COLORS.get(sensor_type, "#457b9d")
+        outline_color = sensor_color if sensor_available else "#6c757d"
+        dash_style = (4, 3) if not sensor_available else None
 
         if sensor_type in (0, 3):
             radius = float(params.get("max_range", 200.0))
@@ -994,12 +1011,14 @@ class DemoUI:
             cx2, cy2 = self._world_to_canvas(ux + radius, uy + radius, map_w, map_h)
             oval_kwargs: Dict[str, Any] = {
                 "outline": outline_color,
-                "width": 1 if sensor_available else 2,
-                "fill": "#adb5bd" if not sensor_available else "",
+                "width": 1.5,
+                "fill": sensor_color if sensor_available else "",
             }
-            if not sensor_available:
+            if sensor_available:
+                # Tkinter Canvas 不支持真 alpha，这里用 stipple 近似 0.2 透明度。
+                oval_kwargs["stipple"] = "gray25"
+            else:
                 oval_kwargs["dash"] = dash_style
-                oval_kwargs["stipple"] = "gray50"
             self.canvas.create_oval(
                 cx1,
                 cy2,
@@ -1022,12 +1041,14 @@ class DemoUI:
             pts.extend([cx, cy])
         poly_kwargs: Dict[str, Any] = {
             "outline": outline_color,
-            "fill": "" if sensor_available else "#adb5bd",
-            "width": 1 if sensor_available else 2,
+            "fill": sensor_color if sensor_available else "",
+            "width": 1.5,
         }
-        if not sensor_available:
+        if sensor_available:
+            # Tkinter Canvas 不支持真 alpha，这里用 stipple 近似 0.2 透明度。
+            poly_kwargs["stipple"] = "gray25"
+        else:
             poly_kwargs["dash"] = dash_style
-            poly_kwargs["stipple"] = "gray50"
         self.canvas.create_polygon(*pts, **poly_kwargs)
 
     def _draw_bearing_ray(

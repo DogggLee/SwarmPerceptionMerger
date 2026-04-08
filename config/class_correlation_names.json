@@ -1,0 +1,82 @@
+{
+  "RADAR": {
+    "R_TRACK_A": {
+      "RADAR": ["R_TRACK_A"],
+      "IF": ["I_CAND_A"],
+      "RGB": ["RGB_CAR"],
+      "ELEC": ["EL_PULSE"]
+    },
+    "R_TRACK_B": {
+      "RADAR": ["R_TRACK_B"],
+      "IF": ["I_CAND_B"],
+      "RGB": ["RGB_TRUCK"],
+      "ELEC": ["EL_CW"]
+    },
+    "R_TRACK_C": {
+      "RADAR": ["R_TRACK_C"],
+      "IF": ["I_CAND_C"],
+      "RGB": ["RGB_UAV"],
+      "ELEC": ["EL_HOP"]
+    }
+  },
+  "IF": {
+    "I_CAND_A": {
+      "RADAR": ["R_TRACK_A"],
+      "IF": ["I_CAND_A"],
+      "RGB": ["RGB_CAR"],
+      "ELEC": ["EL_PULSE"]
+    },
+    "I_CAND_B": {
+      "RADAR": ["R_TRACK_B"],
+      "IF": ["I_CAND_B"],
+      "RGB": ["RGB_TRUCK"],
+      "ELEC": ["EL_CW"]
+    },
+    "I_CAND_C": {
+      "RADAR": ["R_TRACK_C"],
+      "IF": ["I_CAND_C"],
+      "RGB": ["RGB_UAV"],
+      "ELEC": ["EL_HOP"]
+    }
+  },
+  "RGB": {
+    "RGB_CAR": {
+      "RADAR": ["R_TRACK_A"],
+      "IF": ["I_CAND_A"],
+      "RGB": ["RGB_CAR"],
+      "ELEC": ["EL_PULSE"]
+    },
+    "RGB_TRUCK": {
+      "RADAR": ["R_TRACK_B"],
+      "IF": ["I_CAND_B"],
+      "RGB": ["RGB_TRUCK"],
+      "ELEC": ["EL_CW"]
+    },
+    "RGB_UAV": {
+      "RADAR": ["R_TRACK_C"],
+      "IF": ["I_CAND_C"],
+      "RGB": ["RGB_UAV"],
+      "ELEC": ["EL_HOP"]
+    }
+  },
+  "ELEC": {
+    "EL_PULSE": {
+      "RADAR": ["R_TRACK_A"],
+      "IF": ["I_CAND_A"],
+      "RGB": ["RGB_CAR"],
+      "ELEC": ["EL_PULSE"]
+    },
+    "EL_CW": {
+      "RADAR": ["R_TRACK_B"],
+      "IF": ["I_CAND_B"],
+      "RGB": ["RGB_TRUCK"],
+      "ELEC": ["EL_CW"]
+    },
+    "EL_HOP": {
+      "RADAR": ["R_TRACK_C"],
+      "IF": ["I_CAND_C"],
+      "RGB": ["RGB_UAV"],
+      "ELEC": ["EL_HOP"]
+    }
+  }
+}

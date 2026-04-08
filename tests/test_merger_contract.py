@@ -19,6 +19,72 @@ def _build_merger() -> PerceptionMerger:
 
 
 class TestMergerContract(unittest.TestCase):
+    def test_class_correlation_int_form_is_normalized_to_int_internal_structure(self) -> None:
+        corr_int = {
+            2: {
+                11: {
+                    0: [1],
+                    3: [5, 6],
+                }
+            }
+        }
+        merger = PerceptionMerger(config=MergeConfig(), class_correlation=corr_int)
+        self.assertIn(2, merger.class_correlation)
+        self.assertIn(11, merger.class_correlation[2])
+        self.assertEqual(merger.class_correlation[2][11][3], [5, 6])
+
+        obj = ObjectItem.from_dict(
+            {
+                "global_id": 1,
+                "position": [0.0, 0.0, 0.0],
+                "velocity": [0.0, 0.0, 0.0],
+                "timestamp": 1.0,
+                "class_by_sensor": {"3": 6},
+                "class_votes": {"3": {"6": 1}},
+                "trajectory": [[0.0, 0.0, 0.0]],
+                "observations": [],
+            }
+        )
+        self.assertTrue(merger._class_compatible(sensor_type=2, class_id=11, obj=obj))
+
+    def test_class_correlation_string_form_can_be_mapped_by_names_json(self) -> None:
+        names_mapping = {
+            "sensor_type": {"0": "RADAR", "2": "RGB", "3": "ELEC"},
+            "class_id": {"1": "FIGHTER", "5": "DRONE", "6": "HELI"},
+        }
+        corr_string = {
+            "RGB": {
+                "FIGHTER": {
+                    "ELEC": ["DRONE", "HELI"],
+                    "RADAR": ["FIGHTER"],
+                }
+            }
+        }
+        merger = PerceptionMerger(config=MergeConfig(), class_correlation=corr_string, names_mapping=names_mapping)
+        self.assertEqual(merger.class_correlation[2][1][3], [5, 6])
+        self.assertEqual(merger.class_correlation[2][1][0], [1])
+        self.assertEqual(merger._stringify_class_correlation(merger.class_correlation)["RGB"]["FIGHTER"]["ELEC"], ["DRONE", "HELI"])
+
+    def test_class_correlation_string_form_supports_per_sensor_class_names(self) -> None:
+        names_mapping = {
+            "sensor_type": {"2": "RGB", "3": "ELEC"},
+            "class_id_by_sensor": {
+                "RGB": {"1": "RGB_CAR"},
+                "ELEC": {"1": "EL_PULSE"},
+            },
+        }
+        corr_string = {
+            "RGB": {
+                "RGB_CAR": {
+                    "ELEC": ["EL_PULSE"],
+                }
+            }
+        }
+        merger = PerceptionMerger(config=MergeConfig(), class_correlation=corr_string, names_mapping=names_mapping)
+        self.assertEqual(merger.class_correlation[2][1][3], [1])
+        printable = merger._stringify_class_correlation(merger.class_correlation)
+        self.assertEqual(printable["RGB"]["RGB_CAR"]["ELEC"], ["EL_PULSE"])
+
     def test_track_cost_uses_dtw_with_full_history_in_timestamp_window(self) -> None:
         merger = _build_merger()
         key = (1, 2, 7)
@@ -241,8 +307,39 @@ class TestMergerContract(unittest.TestCase):
         self.assertEqual(result.update_ops[0].operation, "update")
         self.assertIn("fused_position", result.update_ops[0].payload)
         self.assertEqual(len(result.create_ops), 1)
-        self.assertEqual(result.create_ops[0].target_id, -1)
+        self.assertEqual(result.create_ops[0].target_id, 11)
         self.assertEqual(result.create_ops[0].operation, "create")
+
+    def test_merge_frame_allocates_sequential_global_ids_for_new_targets(self) -> None:
+        merger = _build_merger()
+        frame = PerceptionFrame.from_dict(
+            {
+                "uav_id": 1,
+                "sensor_type": 2,
+                "sensor_position": [0.0, 0.0, 10.0],
+                "sensor_orientation": [0.0, 0.0, 0.0],
+                "timestamp": 5.0,
+                "detections": [
+                    {
+                        "class_id": 2,
+                        "position": [300.0, 0.0, 0.0],
+                        "velocity": [0.0, 0.0, 0.0],
+                        "track_id": 201,
+                    },
+                    {
+                        "class_id": 3,
+                        "position": [450.0, 80.0, 0.0],
+                        "velocity": [0.0, 0.0, 0.0],
+                        "track_id": 202,
+                    },
+                ],
+            }
+        )
+
+        result = merger.merge_frame(frame, [])
+        self.assertEqual(len(result.create_ops), 2)
+        self.assertEqual(result.create_ops[0].target_id, 0)
+        self.assertEqual(result.create_ops[1].target_id, 1)
 
     def test_merge_batch_keeps_processing_multiple_frames(self) -> None:
         merger = _build_merger()
