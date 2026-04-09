@@ -10,6 +10,10 @@ import urllib.request
 from tkinter import filedialog, ttk
 from typing import Any, Dict, List, Optional, Tuple
 
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
+from matplotlib.patches import Circle, Polygon, Rectangle
+
 from simulator.env import SwarmEnv
 from simulator.global_info import GlobalInfo
 from utils.data_utils import MergeResult, SensorType
@@ -114,11 +118,15 @@ class DemoUI:
         self.running = False
         self.step_count = 0
         self.latest_status = "Not initialized."
+        self._canvas_resize_job: Optional[str] = None
+        self._last_pool_text: Optional[str] = None
+        self.target_truth_history: Dict[int, List[Tuple[float, float]]] = {}
+        self.target_traj_max_len = 200
+        self.pool_text_widget: Optional[tk.Text] = None
 
         self.root = tk.Tk()
         self.root.title("Swarm Demo Control")
         self.root.geometry("1300x860")
-        self.pool_rows_frame: Optional[ttk.Frame] = None
 
         self._build_layout()
         self._draw_idle()
@@ -158,10 +166,12 @@ class DemoUI:
 
         ttk.Label(ctrl, text="Display Layers", font=("", 11, "bold")).pack(anchor="w", pady=(8, 2))
         self.show_truth_var = tk.BooleanVar(value=True)
-        self.show_sensor_var = tk.BooleanVar(value=True)
+        self.show_truth_traj_var = tk.BooleanVar(value=True)
+        self.show_sensor_var = tk.BooleanVar(value=bool(self.base_demo_cfg.get("show_sensor_range", True)))
         self.show_obs_var = tk.BooleanVar(value=True)
         self.show_match_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(ctrl, text="Show Target Truth", variable=self.show_truth_var, command=self.redraw).pack(anchor="w")
+        ttk.Checkbutton(ctrl, text="Show Target Trajectory", variable=self.show_truth_traj_var, command=self.redraw).pack(anchor="w")
         ttk.Checkbutton(ctrl, text="Show Sensor Range", variable=self.show_sensor_var, command=self.redraw).pack(anchor="w")
         ttk.Checkbutton(ctrl, text="Show Observation History", variable=self.show_obs_var, command=self.redraw).pack(anchor="w")
         ttk.Checkbutton(ctrl, text="Show Match Edges", variable=self.show_match_var, command=self.redraw).pack(anchor="w")
@@ -172,21 +182,68 @@ class DemoUI:
         self.env_tab = ttk.Frame(notebook)
         self.merge_tab = ttk.Frame(notebook)
         self.global_tab = ttk.Frame(notebook)
+        self.sensor_tab = ttk.Frame(notebook)
         notebook.add(self.env_tab, text="Env")
         notebook.add(self.merge_tab, text="Merge")
         notebook.add(self.global_tab, text="GlobalState")
+        notebook.add(self.sensor_tab, text="Sensors")
 
         self._build_env_tab()
         self._build_merge_tab()
         self._build_global_tab()
+        self._build_sensor_tab()
         self._build_global_pool_panel(ctrl)
 
         self.status_var = tk.StringVar(value=self.latest_status)
         ttk.Label(ctrl, textvariable=self.status_var, wraplength=380).pack(anchor="w", pady=(10, 0))
 
         ttk.Label(vis, text="Global Situation", font=("", 12, "bold")).grid(row=0, column=0, sticky="w")
-        self.canvas = tk.Canvas(vis, width=860, height=780, bg="white")
-        self.canvas.grid(row=1, column=0, sticky="nsew", pady=(6, 0))
+        self.fig = Figure(figsize=(8.6, 7.8), dpi=100, facecolor="white")
+        self.ax = self.fig.add_subplot(111)
+        self.plot_canvas = FigureCanvasTkAgg(self.fig, master=vis)
+        self.plot_widget = self.plot_canvas.get_tk_widget()
+        self.plot_widget.grid(row=1, column=0, sticky="nsew", pady=(6, 0))
+        self.plot_widget.bind("<Configure>", self._on_canvas_configure)
+
+    def _on_canvas_configure(self, event: tk.Event) -> None:
+        """在画布尺寸变化时触发重绘，保持内容居中且自适应窗口大小。
+
+        Args:
+            event (tk.Event): Tkinter 画布尺寸变化事件。
+        Returns:
+            None: 无返回值，延迟触发重绘。
+        """
+        if event.widget is not self.plot_widget:
+            return
+        if self._canvas_resize_job is not None:
+            self.root.after_cancel(self._canvas_resize_job)
+        # 防抖处理，避免拖动窗口时高频重绘造成卡顿。
+        self._canvas_resize_job = self.root.after(60, self._redraw_after_resize)
+
+    def _redraw_after_resize(self) -> None:
+        """执行尺寸变化后的重绘动作。
+
+        Args:
+            None: 无输入参数。
+        Returns:
+            None: 无返回值，直接调用重绘流程。
+        """
+        self._canvas_resize_job = None
+        self._sync_figure_size_to_widget()
+        self.redraw()
+
+    def _sync_figure_size_to_widget(self) -> None:
+        """将 Matplotlib Figure 尺寸同步到当前 Tk 绘图控件尺寸。
+
+        Args:
+            None: 无输入参数。
+        Returns:
+            None: 无返回值，直接更新 Figure 尺寸。
+        """
+        w = max(1, int(self.plot_widget.winfo_width() or 1))
+        h = max(1, int(self.plot_widget.winfo_height() or 1))
+        dpi = float(self.fig.get_dpi() or 100.0)
+        self.fig.set_size_inches(w / dpi, h / dpi, forward=True)
 
     def _build_env_tab(self) -> None:
         uav_counts = self._extract_uav_counts(self.base_env_cfg)
@@ -301,22 +358,32 @@ class DemoUI:
         return default_counts
 
     def _build_merge_tab(self) -> None:
+        """构建 Merge 参数页签，配置服务地址、超时、模式和循环频率。
+
+        Args:
+            None: 无输入参数。
+        Returns:
+            None: 无返回值，直接构建并绑定界面控件。
+        """
         self.merge_url = tk.StringVar(value=str(self.base_demo_cfg.get("merger_server_url", "http://127.0.0.1:6801")))
         self.merge_timeout = tk.StringVar(value=str(self.base_demo_cfg.get("http_timeout_s", 3.0)))
         self.merge_mode = tk.StringVar(value=str(self.base_demo_cfg.get("merge_mode", "simple")))
         self.step_sleep = tk.StringVar(value=str(self.base_demo_cfg.get("step_sleep_s", 0.0)))
+        default_loop_rate = 1.0 / max(float(self.base_env_cfg.get("dt", 0.5)), 1e-6)
+        self.loop_rate = tk.StringVar(value=str(self.base_demo_cfg.get("loop_rate", default_loop_rate)))
         for i, (label, var) in enumerate(
             [
                 ("server_url", self.merge_url),
                 ("http_timeout_s", self.merge_timeout),
                 ("merge_mode", self.merge_mode),
+                ("loop_rate", self.loop_rate),
                 ("step_sleep_s", self.step_sleep),
             ]
         ):
             ttk.Label(self.merge_tab, text=label).grid(row=i, column=0, sticky="w", padx=6, pady=4)
             ttk.Entry(self.merge_tab, textvariable=var, width=24).grid(row=i, column=1, sticky="ew", padx=6, pady=4)
         btn_bar = ttk.Frame(self.merge_tab)
-        btn_bar.grid(row=4, column=0, columnspan=2, sticky="ew", padx=6, pady=(10, 4))
+        btn_bar.grid(row=5, column=0, columnspan=2, sticky="ew", padx=6, pady=(10, 4))
         ttk.Button(btn_bar, text="Load", command=self._on_load_demo_config).pack(side="left")
         ttk.Button(btn_bar, text="Save", command=self._on_save_demo_config).pack(side="left", padx=(8, 0))
         self.merge_tab.columnconfigure(1, weight=1)
@@ -343,6 +410,56 @@ class DemoUI:
         ttk.Button(btn_bar, text="Save", command=self._on_save_global_config).pack(side="left", padx=(8, 0))
         self.global_tab.columnconfigure(1, weight=1)
 
+    def _build_sensor_tab(self) -> None:
+        """构建 Sensors 参数页签，配置各模态感知范围尺寸。
+
+        Args:
+            None: 无输入参数。
+        Returns:
+            None: 无返回值，直接构建并绑定界面控件。
+        """
+        self.sensor_radar_max_range = tk.StringVar(value=str(self._get_sensor_param(self.base_env_cfg, "RADAR", "max_range", 200.0)))
+        self.sensor_if_forward_range = tk.StringVar(value=str(self._get_sensor_param(self.base_env_cfg, "IF", "forward_range", 300.0)))
+        self.sensor_if_width = tk.StringVar(value=str(self._get_sensor_param(self.base_env_cfg, "IF", "width", 200.0)))
+        self.sensor_rgb_forward_range = tk.StringVar(value=str(self._get_sensor_param(self.base_env_cfg, "RGB", "forward_range", 320.0)))
+        self.sensor_rgb_width = tk.StringVar(value=str(self._get_sensor_param(self.base_env_cfg, "RGB", "width", 220.0)))
+        self.sensor_elec_max_range = tk.StringVar(value=str(self._get_sensor_param(self.base_env_cfg, "ELEC", "max_range", 320.0)))
+
+        sensor_rows = [
+            ("RADAR.max_range", self.sensor_radar_max_range),
+            ("IF.forward_range", self.sensor_if_forward_range),
+            ("IF.width", self.sensor_if_width),
+            ("RGB.forward_range", self.sensor_rgb_forward_range),
+            ("RGB.width", self.sensor_rgb_width),
+            ("ELEC.max_range", self.sensor_elec_max_range),
+        ]
+        for i, (label, var) in enumerate(sensor_rows):
+            ttk.Label(self.sensor_tab, text=label).grid(row=i, column=0, sticky="w", padx=6, pady=4)
+            ttk.Entry(self.sensor_tab, textvariable=var, width=24).grid(row=i, column=1, sticky="ew", padx=6, pady=4)
+
+        btn_bar = ttk.Frame(self.sensor_tab)
+        btn_bar.grid(row=len(sensor_rows), column=0, columnspan=2, sticky="ew", padx=6, pady=(10, 4))
+        ttk.Button(btn_bar, text="Load", command=self._on_load_env_config).pack(side="left")
+        ttk.Button(btn_bar, text="Save", command=self._on_save_env_config).pack(side="left", padx=(8, 0))
+        self.sensor_tab.columnconfigure(1, weight=1)
+
+    def _get_sensor_param(self, env_cfg: Dict[str, Any], profile_name: str, key: str, default: float) -> float:
+        """读取环境配置中指定模态传感器参数。
+
+        Args:
+            env_cfg (Dict[str, Any]): 环境配置字典。
+            profile_name (str): 模态名称（如 RADAR/IF/RGB/ELEC）。
+            key (str): 参数键名（如 max_range/forward_range/width）。
+            default (float): 缺省值。
+        Returns:
+            float: 解析后的参数值。
+        """
+        profiles = env_cfg.get("uav_profiles", {})
+        profile = profiles.get(profile_name, {})
+        sensor_cfg = profile.get("sensor", {})
+        params = sensor_cfg.get("params", {})
+        return float(params.get(key, default))
+
     def _collect_configs(self) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
         env_cfg = dict(self.base_env_cfg)
         env_cfg["dt"] = float(self.env_dt.get())
@@ -358,13 +475,26 @@ class DemoUI:
             "RGB": int(self.env_count_rgb.get()),
             "ELEC": int(self.env_count_elec.get()),
         }
+        profiles = env_cfg.setdefault("uav_profiles", {})
+        for sensor_name in ("RADAR", "IF", "RGB", "ELEC"):
+            profile = profiles.setdefault(sensor_name, {})
+            sensor_cfg = profile.setdefault("sensor", {})
+            sensor_cfg.setdefault("params", {})
+        profiles["RADAR"]["sensor"]["params"]["max_range"] = float(self.sensor_radar_max_range.get())
+        profiles["IF"]["sensor"]["params"]["forward_range"] = float(self.sensor_if_forward_range.get())
+        profiles["IF"]["sensor"]["params"]["width"] = float(self.sensor_if_width.get())
+        profiles["RGB"]["sensor"]["params"]["forward_range"] = float(self.sensor_rgb_forward_range.get())
+        profiles["RGB"]["sensor"]["params"]["width"] = float(self.sensor_rgb_width.get())
+        profiles["ELEC"]["sensor"]["params"]["max_range"] = float(self.sensor_elec_max_range.get())
         env_cfg["class_correlation"] = self.class_correlation
 
         demo_cfg = dict(self.base_demo_cfg)
         demo_cfg["merger_server_url"] = str(self.merge_url.get())
         demo_cfg["http_timeout_s"] = float(self.merge_timeout.get())
         demo_cfg["merge_mode"] = str(self.merge_mode.get())
+        demo_cfg["loop_rate"] = float(self.loop_rate.get())
         demo_cfg["step_sleep_s"] = float(self.step_sleep.get())
+        demo_cfg["show_sensor_range"] = bool(self.show_sensor_var.get())
 
         global_cfg = dict(self.base_global_cfg)
         global_cfg["valid_observation_count"] = int(self.global_valid_obs.get())
@@ -540,6 +670,13 @@ class DemoUI:
         self.env_count_if.set(str(counts["IF"]))
         self.env_count_rgb.set(str(counts["RGB"]))
         self.env_count_elec.set(str(counts["ELEC"]))
+        if hasattr(self, "sensor_radar_max_range"):
+            self.sensor_radar_max_range.set(str(self._get_sensor_param(env_cfg, "RADAR", "max_range", 200.0)))
+            self.sensor_if_forward_range.set(str(self._get_sensor_param(env_cfg, "IF", "forward_range", 300.0)))
+            self.sensor_if_width.set(str(self._get_sensor_param(env_cfg, "IF", "width", 200.0)))
+            self.sensor_rgb_forward_range.set(str(self._get_sensor_param(env_cfg, "RGB", "forward_range", 320.0)))
+            self.sensor_rgb_width.set(str(self._get_sensor_param(env_cfg, "RGB", "width", 220.0)))
+            self.sensor_elec_max_range.set(str(self._get_sensor_param(env_cfg, "ELEC", "max_range", 320.0)))
 
     def _apply_demo_config_to_vars(self, demo_cfg: Dict[str, Any]) -> None:
         """将 Merge 配置字典写回界面输入变量。
@@ -552,7 +689,10 @@ class DemoUI:
         self.merge_url.set(str(demo_cfg.get("merger_server_url", "http://127.0.0.1:6801")))
         self.merge_timeout.set(str(demo_cfg.get("http_timeout_s", 3.0)))
         self.merge_mode.set(str(demo_cfg.get("merge_mode", "simple")))
+        default_loop_rate = 1.0 / max(float(self.env_dt.get()), 1e-6)
+        self.loop_rate.set(str(demo_cfg.get("loop_rate", default_loop_rate)))
         self.step_sleep.set(str(demo_cfg.get("step_sleep_s", 0.0)))
+        self.show_sensor_var.set(bool(demo_cfg.get("show_sensor_range", True)))
 
     def _apply_global_config_to_vars(self, global_cfg: Dict[str, Any]) -> None:
         """将 GlobalState 配置字典写回界面输入变量。
@@ -588,16 +728,18 @@ class DemoUI:
         body.columnconfigure(0, weight=1)
         body.rowconfigure(0, weight=1)
 
-        canvas = tk.Canvas(body, borderwidth=0, highlightthickness=0, bg="white")
-        scrollbar = ttk.Scrollbar(body, orient="vertical", command=canvas.yview)
-        self.pool_rows_frame = ttk.Frame(canvas)
-        self.pool_rows_frame.bind(
-            "<Configure>",
-            lambda _evt: canvas.configure(scrollregion=canvas.bbox("all")),
+        self.pool_text_widget = tk.Text(
+            body,
+            wrap="none",
+            height=12,
+            bg="white",
+            borderwidth=0,
+            highlightthickness=0,
+            font=("Courier New", 10),
         )
-        canvas.create_window((0, 0), window=self.pool_rows_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-        canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(body, orient="vertical", command=self.pool_text_widget.yview)
+        self.pool_text_widget.configure(yscrollcommand=scrollbar.set, state="disabled")
+        self.pool_text_widget.grid(row=0, column=0, sticky="nsew")
         scrollbar.grid(row=0, column=1, sticky="ns")
 
     def on_initialize(self) -> None:
@@ -619,6 +761,7 @@ class DemoUI:
         self._sync_visual_global_items()
         self.step_count = 0
         self.running = False
+        self.target_truth_history = {}
         self._set_status(f"Initialized. merger_service={health}")
         self.redraw()
 
@@ -634,6 +777,13 @@ class DemoUI:
         self._set_status("Paused.")
 
     def _run_loop(self) -> None:
+        """按模式执行单轮仿真与融合，并根据 loop_rate 调度下一轮。
+
+        Args:
+            None: 无输入参数。
+        Returns:
+            None: 无返回值，通过 Tk after 机制继续或停止循环。
+        """
         if not self.running:
             return
         mode = self.mode_var.get()
@@ -652,20 +802,29 @@ class DemoUI:
         self.redraw()
 
         if mode == "continue":
-            dt_ms = int(max(20, float(self.env_dt.get()) * 1000))
-            self.root.after(dt_ms, self._run_loop)
+            self.root.after(self._compute_loop_interval_ms(), self._run_loop)
             return
         if mode == "in-loop":
             # 仅在本轮真实触发融合后暂停；否则继续推进环境直到有帧进入融合链路。
             if processed > 0:
                 self.running = False
             else:
-                dt_ms = int(max(20, float(self.env_dt.get()) * 1000))
-                self.root.after(dt_ms, self._run_loop)
+                self.root.after(self._compute_loop_interval_ms(), self._run_loop)
             return
         if mode == "step":
             self.running = False
             return
+
+    def _compute_loop_interval_ms(self) -> int:
+        """根据 loop_rate(HZ) 计算 run_loop 的真实时间调度间隔。
+
+        Args:
+            None: 无输入参数。
+        Returns:
+            int: 下一次循环调度间隔（毫秒），最小 20ms。
+        """
+        loop_rate_hz = max(1e-6, float(self.loop_rate.get()))
+        return int(max(20.0, 1000.0 / loop_rate_hz))
 
     def _run_one_step(self) -> Tuple[int, int, int]:
         assert self.env is not None
@@ -716,12 +875,15 @@ class DemoUI:
         self.status_var.set(text)
 
     def redraw(self) -> None:
-        self.canvas.delete("all")
+        self._sync_figure_size_to_widget()
+        self.ax.clear()
         self._refresh_global_pool_panel()
         if self.env is None:
             self._draw_idle()
+            self.plot_canvas.draw_idle()
             return
         rs = self.env.get_render_state()
+        self._update_target_truth_history(rs)
         map_w, map_h = self._extract_map_size()
         self._draw_axes(map_w, map_h)
         self._draw_runtime_info(rs)
@@ -731,16 +893,14 @@ class DemoUI:
             x, y = item["position"][0], item["position"][1]
             cx, cy = self._world_to_canvas(x, y, map_w, map_h)
             global_pos_by_id[int(item["global_id"])] = (cx, cy)
-            self.canvas.create_oval(cx - 5, cy - 5, cx + 5, cy + 5, fill="#0077b6", outline="")
-            self.canvas.create_text(cx + 12, cy - 10, text=f"G{item['global_id']}", fill="#0077b6", anchor="w")
+            self.ax.scatter([cx], [cy], c="#0077b6", s=36, marker="o", zorder=4)
+            self.ax.text(cx + map_w * 0.008, cy + map_h * 0.008, f"G{item['global_id']}", color="#0077b6", fontsize=9, zorder=5)
             self._draw_velocity_arrow((x, y), item.get("velocity", [0, 0, 0]), map_w, map_h, "#0077b6")
             traj = item.get("trajectory", [])
             if len(traj) >= 2:
-                pts = []
-                for p in traj[-40:]:
-                    tx, ty = self._world_to_canvas(p[0], p[1], map_w, map_h)
-                    pts.extend([tx, ty])
-                self.canvas.create_line(*pts, fill="#89c2d9", width=1)
+                xs = [float(p[0]) for p in traj[-40:]]
+                ys = [float(p[1]) for p in traj[-40:]]
+                self.ax.plot(xs, ys, color="#89c2d9", linewidth=1.0, zorder=2)
             if self.show_obs_var.get():
                 for obs in item.get("observations", [])[-40:]:
                     sensor_type = int(obs.get("sensor_type", -1))
@@ -755,13 +915,21 @@ class DemoUI:
                         )
                     elif "position" in obs:
                         ox, oy = self._world_to_canvas(obs["position"][0], obs["position"][1], map_w, map_h)
-                        self.canvas.create_oval(ox - 2, oy - 2, ox + 2, oy + 2, fill="#48cae4", outline="")
+                        self.ax.scatter([ox], [oy], c="#48cae4", s=10, marker="o", zorder=3)
 
         if self.show_truth_var.get():
+            if self.show_truth_traj_var.get():
+                for target_id, hist in self.target_truth_history.items():
+                    if len(hist) < 2:
+                        continue
+                    xs = [p[0] for p in hist]
+                    ys = [p[1] for p in hist]
+                    self.ax.plot(xs, ys, color="#ffb703", linewidth=1.2, alpha=0.9, zorder=2)
+                    self.ax.text(xs[-1], ys[-1], f"Tr{target_id}", color="#ffb703", fontsize=7, zorder=3)
             for target in rs.get("targets_truth", []):
                 tx, ty = self._world_to_canvas(target["position"][0], target["position"][1], map_w, map_h)
-                self.canvas.create_rectangle(tx - 5, ty - 5, tx + 5, ty + 5, outline="#f77f00", width=2)
-                self.canvas.create_text(tx + 10, ty + 10, text=f"T{target['target_id']}", fill="#f77f00", anchor="w")
+                self.ax.add_patch(Rectangle((tx - 5.0, ty - 5.0), 10.0, 10.0, fill=False, edgecolor="#f77f00", linewidth=1.6, zorder=4))
+                self.ax.text(tx + map_w * 0.008, ty + map_h * 0.008, f"T{target['target_id']}", color="#f77f00", fontsize=9, zorder=5)
                 self._draw_velocity_arrow(
                     (target["position"][0], target["position"][1]),
                     target.get("velocity", [0, 0, 0]),
@@ -772,24 +940,17 @@ class DemoUI:
 
         for uav in rs.get("uavs", []):
             ux, uy = self._world_to_canvas(uav["position"][0], uav["position"][1], map_w, map_h)
-            self.canvas.create_polygon(
-                ux,
-                uy - 7,
-                ux - 6,
-                uy + 6,
-                ux + 6,
-                uy + 6,
-                fill="#2b9348",
-                outline="",
+            self.ax.add_patch(
+                Polygon(
+                    [[ux, uy + 7.0], [ux - 6.0, uy - 6.0], [ux + 6.0, uy - 6.0]],
+                    closed=True,
+                    facecolor="#2b9348",
+                    edgecolor="none",
+                    zorder=6,
+                )
             )
             sensor_label = SENSOR_LABELS.get(int(uav.get("sensor_type", -1)), f"S{uav.get('sensor_type', '?')}")
-            self.canvas.create_text(
-                ux + 10,
-                uy - 10,
-                text=f"U{uav['uav_id']} [{sensor_label}]",
-                fill="#2b9348",
-                anchor="w",
-            )
+            self.ax.text(ux + map_w * 0.008, uy + map_h * 0.008, f"U{uav['uav_id']} [{sensor_label}]", color="#2b9348", fontsize=9, zorder=7)
             if self.show_sensor_var.get():
                 sensor_available = self._sensor_available_for_draw(
                     sensor_type=int(uav.get("sensor_type", -1)),
@@ -817,12 +978,12 @@ class DemoUI:
                 p2 = global_pos_by_id.get(int(target_id)) if target_id is not None else None
                 if p2:
                     x2, y2 = p2
-                    self.canvas.create_line(x1, y1, x2, y2, fill="#d00000", dash=(4, 2), width=2)
+                    self.ax.plot([x1, x2], [y1, y2], color="#d00000", linestyle=(0, (4, 2)), linewidth=1.5, zorder=3)
                     score = edge.get("score")
                     if score is not None:
-                        self.canvas.create_text((x1 + x2) / 2, (y1 + y2) / 2, text=f"{score:.2f}", fill="#d00000")
+                        self.ax.text((x1 + x2) / 2.0, (y1 + y2) / 2.0, f"{score:.2f}", color="#d00000", fontsize=8, zorder=4)
                 else:
-                    self.canvas.create_oval(x1 - 3, y1 - 3, x1 + 3, y1 + 3, fill="#d00000", outline="")
+                    self.ax.scatter([x1], [y1], c="#d00000", s=16, zorder=4)
 
         if self.show_obs_var.get():
             # 绘制缓存池中的ELEC观测射线（不绘制伪position点）。
@@ -843,10 +1004,40 @@ class DemoUI:
                             color="#ff6b6b",
                             length=220.0,
                         )
+        self.plot_canvas.draw_idle()
+
+    def _update_target_truth_history(self, render_state: Dict[str, Any]) -> None:
+        """维护任务目标真实轨迹历史，用于可选轨迹显示。
+
+        Args:
+            render_state (Dict[str, Any]): 环境渲染状态字典，需包含 `targets_truth` 列表。
+        Returns:
+            None: 无返回值，更新内部目标轨迹缓存。
+        """
+        targets = render_state.get("targets_truth", [])
+        active_ids: set[int] = set()
+        for target in targets:
+            target_id = int(target.get("target_id", -1))
+            pos = target.get("position")
+            if target_id < 0 or not isinstance(pos, (list, tuple)) or len(pos) < 2:
+                continue
+            active_ids.add(target_id)
+            history = self.target_truth_history.setdefault(target_id, [])
+            point = (float(pos[0]), float(pos[1]))
+            if not history or history[-1] != point:
+                history.append(point)
+                if len(history) > self.target_traj_max_len:
+                    del history[: len(history) - self.target_traj_max_len]
+
+        stale_ids = [tid for tid in self.target_truth_history.keys() if tid not in active_ids]
+        for tid in stale_ids:
+            del self.target_truth_history[tid]
 
     def _draw_idle(self) -> None:
-        self.canvas.delete("all")
-        self.canvas.create_text(430, 390, text="Click Initialize to start simulation", fill="gray")
+        self.ax.clear()
+        self.ax.set_axis_off()
+        self.ax.text(0.5, 0.5, "Click Initialize to start simulation", transform=self.ax.transAxes, ha="center", va="center", color="gray", fontsize=12)
+        self.plot_canvas.draw_idle()
 
     def _draw_runtime_info(self, render_state: Dict[str, Any]) -> None:
         """在主画布左上角绘制时间、天气、光照状态。
@@ -860,7 +1051,7 @@ class DemoUI:
         weather = str(render_state.get("weather", "unknown"))
         lighting = str(render_state.get("lighting", "unknown"))
         info_text = f"time={current_time:.2f}s  weather={weather}  lighting={lighting}"
-        self.canvas.create_text(42, 42, text=info_text, anchor="nw", fill="#495057", font=("", 10, "bold"))
+        self.ax.text(0.015, 0.985, info_text, transform=self.ax.transAxes, ha="left", va="top", color="#495057", fontsize=10, fontweight="bold")
 
     def _refresh_global_pool_panel(self) -> None:
         """刷新嵌入式全局态势池面板内容。
@@ -870,62 +1061,37 @@ class DemoUI:
         Returns:
             None: 无返回值，直接更新窗口控件。
         """
-        if self.pool_rows_frame is None:
+        if self.pool_text_widget is None:
             return
-        for child in self.pool_rows_frame.winfo_children():
-            child.destroy()
-
+        text_lines: List[str] = []
         if self.global_info is None:
-            ttk.Label(self.pool_rows_frame, text="GlobalInfo 未初始化。").grid(
-                row=0, column=0, padx=6, pady=6, sticky="w"
-            )
+            text_lines.append("GlobalInfo 未初始化。")
+        else:
+            items = sorted(list(self.global_info.get_all_items()), key=lambda x: x.global_id)
+            if not items:
+                text_lines.append("当前目标记录池为空。")
+            else:
+                current_ts = float(self.global_info.current_timestamp)
+                stale_time = max(float(self.global_info.stale_observation_time), 1e-6)
+                text_lines.append(f"{'全局ID':<10}{'有效观测数量':<16}{'失效进度':<20}")
+                text_lines.append("-" * 46)
+                for item in items:
+                    valid_obs_count = len(item.observations)
+                    last_obs_ts = float(item.timestamp)
+                    if item.observations:
+                        last_obs_ts = max(float(obs.get('timestamp', item.timestamp)) for obs in item.observations)
+                    age = max(0.0, current_ts - last_obs_ts)
+                    text_lines.append(
+                        f"{str(item.global_id):<10}{str(valid_obs_count):<16}{age:.2f}/{stale_time:.2f}"
+                    )
+        text_content = "\n".join(text_lines)
+        if text_content == self._last_pool_text:
             return
-
-        items = sorted(list(self.global_info.get_all_items()), key=lambda x: x.global_id)
-        if not items:
-            ttk.Label(self.pool_rows_frame, text="当前目标记录池为空。").grid(
-                row=0, column=0, padx=6, pady=6, sticky="w"
-            )
-            return
-
-        current_ts = float(self.global_info.current_timestamp)
-        stale_time = max(float(self.global_info.stale_observation_time), 1e-6)
-        header = ["GlobalID", "有效观测数", "删除进度", "时间信息"]
-        for i, text in enumerate(header):
-            ttk.Label(self.pool_rows_frame, text=text, font=("", 10, "bold")).grid(
-                row=0, column=i, padx=6, pady=(4, 8), sticky="w"
-            )
-
-        for row_idx, item in enumerate(items, start=1):
-            valid_obs_count = len(item.observations)
-            last_obs_ts = float(item.timestamp)
-            if item.observations:
-                last_obs_ts = max(float(obs.get("timestamp", item.timestamp)) for obs in item.observations)
-            age = max(0.0, current_ts - last_obs_ts)
-            keep_ratio = max(0.0, min(1.0, 1.0 - age / stale_time))
-
-            ttk.Label(self.pool_rows_frame, text=str(item.global_id)).grid(
-                row=row_idx, column=0, padx=6, pady=6, sticky="w"
-            )
-            ttk.Label(self.pool_rows_frame, text=str(valid_obs_count)).grid(
-                row=row_idx, column=1, padx=6, pady=6, sticky="w"
-            )
-
-            progress = ttk.Progressbar(
-                self.pool_rows_frame,
-                orient="horizontal",
-                mode="determinate",
-                maximum=100.0,
-                value=keep_ratio * 100.0,
-                length=220,
-            )
-            progress.grid(row=row_idx, column=2, padx=6, pady=6, sticky="w")
-
-            remain = max(0.0, stale_time - age)
-            ttk.Label(
-                self.pool_rows_frame,
-                text=f"last={last_obs_ts:.2f}s, age={age:.2f}s, remain={remain:.2f}s",
-            ).grid(row=row_idx, column=3, padx=6, pady=6, sticky="w")
+        self._last_pool_text = text_content
+        self.pool_text_widget.configure(state="normal")
+        self.pool_text_widget.delete("1.0", tk.END)
+        self.pool_text_widget.insert(tk.END, text_content)
+        self.pool_text_widget.configure(state="disabled")
 
     def _extract_map_size(self) -> Tuple[float, float]:
         if self.env is None:
@@ -934,22 +1100,65 @@ class DemoUI:
         return float(size[0]), float(size[1])
 
     def _world_to_canvas(self, x: float, y: float, map_w: float, map_h: float) -> Tuple[float, float]:
-        pad = 30.0
-        w = float(self.canvas.winfo_width() or 860)
-        h = float(self.canvas.winfo_height() or 780)
-        sx = (w - 2 * pad) / max(map_w, 1.0)
-        sy = (h - 2 * pad) / max(map_h, 1.0)
-        cx = pad + x * sx
-        cy = h - pad - y * sy
-        return cx, cy
+        """将世界坐标映射到绘图坐标（Matplotlib 下与世界坐标一致）。
+
+        Args:
+            x (float): 世界坐标系下的 x 坐标。
+            y (float): 世界坐标系下的 y 坐标。
+            map_w (float): 地图世界宽度。
+            map_h (float): 地图世界高度。
+        Returns:
+            Tuple[float, float]: 对应画布坐标 (cx, cy)。
+        """
+        return float(x), float(y)
 
     def _draw_axes(self, map_w: float, map_h: float) -> None:
-        w = float(self.canvas.winfo_width() or 860)
-        h = float(self.canvas.winfo_height() or 780)
-        pad = 30.0
-        self.canvas.create_rectangle(pad, pad, w - pad, h - pad, outline="#ced4da")
-        self.canvas.create_text(pad + 4, h - pad + 14, text="(0,0)", anchor="w", fill="gray")
-        self.canvas.create_text(w - pad - 4, pad - 14, text=f"({int(map_w)},{int(map_h)})", anchor="e", fill="gray")
+        """配置地图坐标轴样式，保持等比例显示。
+
+        Args:
+            map_w (float): 地图世界宽度。
+            map_h (float): 地图世界高度。
+        Returns:
+            None: 无返回值，直接在画布绘制坐标边框与标签。
+        """
+        safe_map_w = max(map_w, 1.0)
+        safe_map_h = max(map_h, 1.0)
+        self._apply_centered_axes_layout(safe_map_w, safe_map_h, occupy_ratio=0.85)
+        self.ax.set_xlim(0.0, safe_map_w)
+        self.ax.set_ylim(0.0, safe_map_h)
+        self.ax.set_aspect("equal", adjustable="box")
+        self.ax.set_anchor("C")
+        self.ax.grid(color="#ced4da", linestyle="--", linewidth=0.6, alpha=0.6)
+        self.ax.set_facecolor("white")
+        self.ax.set_xlabel("X")
+        self.ax.set_ylabel("Y")
+
+    def _apply_centered_axes_layout(self, map_w: float, map_h: float, occupy_ratio: float = 0.85) -> None:
+        """按目标占比与地图宽高比计算居中绘图区域。
+
+        Args:
+            map_w (float): 地图世界宽度。
+            map_h (float): 地图世界高度。
+            occupy_ratio (float): 目标绘图区占 Figure 的比例（0~1）。
+        Returns:
+            None: 无返回值，直接更新 Axes 在 Figure 中的位置。
+        """
+        fig_w_in, fig_h_in = self.fig.get_size_inches()
+        fig_w_px = max(fig_w_in * self.fig.get_dpi(), 1.0)
+        fig_h_px = max(fig_h_in * self.fig.get_dpi(), 1.0)
+        map_ratio = max(map_w, 1e-6) / max(map_h, 1e-6)
+
+        max_w = max(0.01, min(1.0, occupy_ratio))
+        max_h = max(0.01, min(1.0, occupy_ratio))
+        ax_w = max_w
+        ax_h = ax_w * (fig_w_px / fig_h_px) / map_ratio
+        if ax_h > max_h:
+            ax_h = max_h
+            ax_w = ax_h * map_ratio * (fig_h_px / fig_w_px)
+
+        left = (1.0 - ax_w) / 2.0
+        bottom = (1.0 - ax_h) / 2.0
+        self.ax.set_position([left, bottom, ax_w, ax_h])
 
     def _draw_velocity_arrow(
         self,
@@ -966,7 +1175,13 @@ class DemoUI:
         scale = 3.0
         cx1, cy1 = self._world_to_canvas(x, y, map_w, map_h)
         cx2, cy2 = self._world_to_canvas(x + vx * scale, y + vy * scale, map_w, map_h)
-        self.canvas.create_line(cx1, cy1, cx2, cy2, fill=color, arrow=tk.LAST, width=1)
+        self.ax.annotate(
+            "",
+            xy=(cx2, cy2),
+            xytext=(cx1, cy1),
+            arrowprops={"arrowstyle": "->", "color": color, "lw": 1.0},
+            zorder=4,
+        )
 
     def _sensor_available_for_draw(self, sensor_type: int, weather: str, lighting: str) -> bool:
         """在当前天气和光照条件下评估传感器模态是否可用。
@@ -987,7 +1202,7 @@ class DemoUI:
         return True
 
     def _draw_sensor_range(self, uav: Dict[str, Any], map_w: float, map_h: float, sensor_available: bool) -> None:
-        """绘制单个 UAV 的传感器感知范围。
+        """绘制单个 UAV 的传感器感知范围（Matplotlib）。
 
         Args:
             uav (Dict[str, Any]): UAV 状态字典，需包含位置、传感器类型与参数。
@@ -1007,25 +1222,11 @@ class DemoUI:
 
         if sensor_type in (0, 3):
             radius = float(params.get("max_range", 200.0))
-            cx1, cy1 = self._world_to_canvas(ux - radius, uy - radius, map_w, map_h)
-            cx2, cy2 = self._world_to_canvas(ux + radius, uy + radius, map_w, map_h)
-            oval_kwargs: Dict[str, Any] = {
-                "outline": outline_color,
-                "width": 1.5,
-                "fill": sensor_color if sensor_available else "",
-            }
             if sensor_available:
-                # Tkinter Canvas 不支持真 alpha，这里用 stipple 近似 0.2 透明度。
-                oval_kwargs["stipple"] = "gray25"
+                patch = Circle((ux, uy), radius=radius, facecolor=sensor_color, edgecolor=outline_color, linewidth=1.5, alpha=0.2, zorder=1)
             else:
-                oval_kwargs["dash"] = dash_style
-            self.canvas.create_oval(
-                cx1,
-                cy2,
-                cx2,
-                cy1,
-                **oval_kwargs,
-            )
+                patch = Circle((ux, uy), radius=radius, facecolor="none", edgecolor=outline_color, linewidth=1.5, linestyle=(0, dash_style), zorder=1)
+            self.ax.add_patch(patch)
             return
 
         forward = float(params.get("forward_range", 260.0))
@@ -1033,23 +1234,17 @@ class DemoUI:
         corners = [(0.0, -width / 2), (forward, -width / 2), (forward, width / 2), (0.0, width / 2)]
         yaw = math.radians(yaw_deg)
         cos_yaw, sin_yaw = math.cos(yaw), math.sin(yaw)
-        pts = []
+        pts: List[List[float]] = []
         for fx, fy in corners:
             wx = ux + fx * cos_yaw - fy * sin_yaw
             wy = uy + fx * sin_yaw + fy * cos_yaw
             cx, cy = self._world_to_canvas(wx, wy, map_w, map_h)
-            pts.extend([cx, cy])
-        poly_kwargs: Dict[str, Any] = {
-            "outline": outline_color,
-            "fill": sensor_color if sensor_available else "",
-            "width": 1.5,
-        }
+            pts.append([cx, cy])
         if sensor_available:
-            # Tkinter Canvas 不支持真 alpha，这里用 stipple 近似 0.2 透明度。
-            poly_kwargs["stipple"] = "gray25"
+            patch = Polygon(pts, closed=True, facecolor=sensor_color, edgecolor=outline_color, linewidth=1.5, alpha=0.2, zorder=1)
         else:
-            poly_kwargs["dash"] = dash_style
-        self.canvas.create_polygon(*pts, **poly_kwargs)
+            patch = Polygon(pts, closed=True, facecolor="none", edgecolor=outline_color, linewidth=1.5, linestyle=(0, dash_style), zorder=1)
+        self.ax.add_patch(patch)
 
     def _draw_bearing_ray(
         self,
@@ -1071,7 +1266,7 @@ class DemoUI:
         x1, y1 = x0 + ux * length, y0 + uy * length
         cx0, cy0 = self._world_to_canvas(x0, y0, map_w, map_h)
         cx1, cy1 = self._world_to_canvas(x1, y1, map_w, map_h)
-        self.canvas.create_line(cx0, cy0, cx1, cy1, fill=color, dash=(3, 2), width=1)
+        self.ax.plot([cx0, cx1], [cy0, cy1], color=color, linestyle=(0, (3, 2)), linewidth=1.0, zorder=2)
 
     def run(self) -> None:
         self.root.mainloop()
